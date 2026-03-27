@@ -47,6 +47,8 @@ function bindElements() {
   els.uploadChunkMb = document.getElementById("upload-chunk-mb");
   els.cliDownloadWorkers = document.getElementById("cli-download-workers");
   els.webDownloadWorkers = document.getElementById("web-download-workers");
+  els.singleFileParallelEnabled = document.getElementById("single-file-parallel-enabled");
+  els.singleFileDownloadWorkers = document.getElementById("single-file-download-workers");
   els.customSettingsHint = document.getElementById("custom-settings-hint");
   els.readyForApi = document.getElementById("ready-for-api");
   els.authorizedStatus = document.getElementById("authorized-status");
@@ -155,6 +157,7 @@ function bindEvents() {
     updateMembershipPlaceholders();
     updateCustomSettingsHint();
   });
+  els.singleFileParallelEnabled.addEventListener("change", updateCustomSettingsHint);
   els.authButton.addEventListener("click", interceptAuth);
   els.manualAuthForm.addEventListener("submit", submitManualCode);
   els.refreshTokenButton.addEventListener("click", refreshToken);
@@ -239,6 +242,8 @@ function fillSettingsForm(config) {
   els.uploadChunkMb.value = config.upload_chunk_mb > 0 ? config.upload_chunk_mb : "";
   els.cliDownloadWorkers.value = config.cli_download_workers > 0 ? config.cli_download_workers : "";
   els.webDownloadWorkers.value = config.web_download_workers > 0 ? config.web_download_workers : "";
+  els.singleFileParallelEnabled.value = config.single_file_parallel_enabled === false ? "false" : "true";
+  els.singleFileDownloadWorkers.value = config.single_file_download_workers > 0 ? config.single_file_download_workers : "";
   updateMembershipPlaceholders();
   updateCustomSettingsHint();
   ensureUploadDefaults();
@@ -287,27 +292,31 @@ function applyAppPreset() {
 }
 
 function updateCustomSettingsHint() {
+  const singleFileEnabled = els.singleFileParallelEnabled.value !== "false";
+  const singleFileHint = singleFileEnabled
+    ? "单文件下载默认会自动尝试分段并发，不支持 Range 时会自动回退。"
+    : "单文件下载会保持单连接串行模式。";
   const tier = (els.membershipTier.value || "free").toLowerCase();
   if (tier === "svip") {
-    els.customSettingsHint.textContent = "上传分片会按当前账号身份自动使用最高可用档位；下载并发不受会员档限制。";
+    els.customSettingsHint.textContent = `上传分片会按当前账号身份自动使用最高可用档位；下载并发不受会员档限制。${singleFileHint}`;
     return;
   }
   if (tier === "vip") {
-    els.customSettingsHint.textContent = "上传分片会按当前账号身份自动使用最高可用档位；下载并发不受会员档限制。";
+    els.customSettingsHint.textContent = `上传分片会按当前账号身份自动使用最高可用档位；下载并发不受会员档限制。${singleFileHint}`;
     return;
   }
-  els.customSettingsHint.textContent = "默认显示无会员档。授权后会根据当前账号身份自动切到最高上传档位；下载并发不受会员档限制。";
+  els.customSettingsHint.textContent = `默认显示无会员档。授权后会根据当前账号身份自动切到最高上传档位；下载并发不受会员档限制。${singleFileHint}`;
 }
 
 function membershipRanges(tier) {
   const normalized = (tier || "free").toLowerCase();
   if (normalized === "free") {
-    return { upload: "1-4，留空=4", workers: "1-8，留空=8" };
+    return { upload: "1-4，留空=4", workers: "1-8，留空=8", singleFileWorkers: "1-8，留空=4" };
   }
   if (normalized === "vip") {
-    return { upload: "1-16，留空=16", workers: "1-8，留空=8" };
+    return { upload: "1-16，留空=16", workers: "1-8，留空=8", singleFileWorkers: "1-8，留空=4" };
   }
-  return { upload: "1-32，留空=32", workers: "1-8，留空=8" };
+  return { upload: "1-32，留空=32", workers: "1-8，留空=8", singleFileWorkers: "1-8，留空=4" };
 }
 
 function updateMembershipPlaceholders() {
@@ -315,6 +324,7 @@ function updateMembershipPlaceholders() {
   els.uploadChunkMb.placeholder = ranges.upload;
   els.cliDownloadWorkers.placeholder = ranges.workers;
   els.webDownloadWorkers.placeholder = ranges.workers;
+  els.singleFileDownloadWorkers.placeholder = ranges.singleFileWorkers;
 }
 
 function renderConnection(data) {
@@ -349,6 +359,8 @@ async function saveSettings(event) {
     upload_chunk_mb: Number(els.uploadChunkMb.value || 0),
     cli_download_workers: Number(els.cliDownloadWorkers.value || 0),
     web_download_workers: Number(els.webDownloadWorkers.value || 0),
+    single_file_parallel_enabled: els.singleFileParallelEnabled.value !== "false",
+    single_file_download_workers: Number(els.singleFileDownloadWorkers.value || 0),
   };
   await api("/api/settings", {
     method: "POST",

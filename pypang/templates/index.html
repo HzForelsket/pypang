@@ -502,6 +502,17 @@
               <span>Web 下载并发</span>
               <input id="web-download-workers" name="web_download_workers" type="number" min="1" step="1" form="settings-form" />
             </label>
+            <label>
+              <span>单文件并发下载</span>
+              <select id="single-file-parallel-enabled" name="single_file_parallel_enabled" form="settings-form">
+                <option value="true">开启</option>
+                <option value="false">关闭</option>
+              </select>
+            </label>
+            <label>
+              <span>单文件并发连接数</span>
+              <input id="single-file-download-workers" name="single_file_download_workers" type="number" min="1" step="1" form="settings-form" />
+            </label>
             <p id="custom-settings-hint" class="panel-note">默认按无会员能力运行。</p>
           </div>
         </div>

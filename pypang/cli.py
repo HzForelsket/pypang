@@ -46,6 +46,12 @@ def _build_parser() -> argparse.ArgumentParser:
     config_set.add_argument("--upload-chunk-mb", type=int)
     config_set.add_argument("--cli-download-workers", type=int)
     config_set.add_argument("--web-download-workers", type=int)
+    config_set.add_argument(
+        "--single-file-parallel-enabled",
+        dest="single_file_parallel_enabled",
+        action=argparse.BooleanOptionalAction,
+    )
+    config_set.add_argument("--single-file-download-workers", type=int)
 
     auth_cmd = sub.add_parser("auth", help="Authorization helpers.")
     auth_sub = auth_cmd.add_subparsers(dest="auth_command", required=True)
@@ -97,11 +103,23 @@ def _build_parser() -> argparse.ArgumentParser:
     download_cmd.add_argument("remote_path")
     download_cmd.add_argument("destination", nargs="?")
     download_cmd.add_argument("--no-resume", action="store_true")
+    download_cmd.add_argument(
+        "--single-file-parallel",
+        dest="single_file_parallel",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
 
     get_cmd = sub.add_parser("get", help="Alias of download.")
     get_cmd.add_argument("remote_path")
     get_cmd.add_argument("destination", nargs="?")
     get_cmd.add_argument("--no-resume", action="store_true")
+    get_cmd.add_argument(
+        "--single-file-parallel",
+        dest="single_file_parallel",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
 
     rename_cmd = sub.add_parser("rename", help="Rename a remote file or folder.")
     rename_cmd.add_argument("path")
@@ -299,6 +317,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.destination,
                 resume=not args.no_resume,
                 progress_callback=progress.update,
+                single_file_parallel=args.single_file_parallel,
             )
             progress.finish()
             print(target)
@@ -343,6 +362,8 @@ def _handle_config(store: StateStore, args) -> int:
         "upload_chunk_mb",
         "cli_download_workers",
         "web_download_workers",
+        "single_file_parallel_enabled",
+        "single_file_download_workers",
     ):
         value = getattr(args, field, None)
         if value not in (None, ""):

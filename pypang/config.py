@@ -13,6 +13,7 @@ DEFAULT_STATE_PATH = Path(".runtime/state.json")
 DEFAULT_TEMP_DIR = Path(".runtime/tmp")
 DEFAULT_LEGACY_CONFIG_PATH = Path("config.json")
 DEFAULT_MEMBERSHIP_TIER = "free"
+DEFAULT_SINGLE_FILE_DOWNLOAD_WORKERS = 4
 
 
 def _env_int(name: str, default: int) -> int:
@@ -27,6 +28,16 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _coerce_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off", ""}
+    return bool(value)
 
 
 def runtime_state_path() -> Path:
@@ -61,6 +72,8 @@ class AppConfig:
     upload_chunk_mb: int = 0
     cli_download_workers: int = 0
     web_download_workers: int = 0
+    single_file_parallel_enabled: bool = True
+    single_file_download_workers: int = 0
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "AppConfig":
@@ -71,12 +84,15 @@ class AppConfig:
         upload_chunk_mb = payload.get("upload_chunk_mb", 0)
         cli_download_workers = payload.get("cli_download_workers", 0)
         web_download_workers = payload.get("web_download_workers", 0)
+        single_file_download_workers = payload.get("single_file_download_workers", 0)
         if isinstance(upload_chunk_mb, str) and upload_chunk_mb.strip():
             upload_chunk_mb = int(upload_chunk_mb)
         if isinstance(cli_download_workers, str) and cli_download_workers.strip():
             cli_download_workers = int(cli_download_workers)
         if isinstance(web_download_workers, str) and web_download_workers.strip():
             web_download_workers = int(web_download_workers)
+        if isinstance(single_file_download_workers, str) and single_file_download_workers.strip():
+            single_file_download_workers = int(single_file_download_workers)
 
         return cls(
             app_key=str(payload.get("app_key", "")).strip(),
@@ -97,6 +113,8 @@ class AppConfig:
             upload_chunk_mb=max(0, int(upload_chunk_mb)),
             cli_download_workers=max(0, int(cli_download_workers)),
             web_download_workers=max(0, int(web_download_workers)),
+            single_file_parallel_enabled=_coerce_bool(payload.get("single_file_parallel_enabled"), True),
+            single_file_download_workers=max(0, int(single_file_download_workers)),
         )
 
     @classmethod
@@ -118,6 +136,8 @@ class AppConfig:
                 "upload_chunk_mb": _env_int("BAIDUPANWEB_UPLOAD_CHUNK_MB", 0),
                 "cli_download_workers": _env_int("BAIDUPANWEB_CLI_DOWNLOAD_WORKERS", 0),
                 "web_download_workers": _env_int("BAIDUPANWEB_WEB_DOWNLOAD_WORKERS", 0),
+                "single_file_parallel_enabled": _env_bool("BAIDUPANWEB_SINGLE_FILE_PARALLEL_ENABLED", True),
+                "single_file_download_workers": _env_int("BAIDUPANWEB_SINGLE_FILE_DOWNLOAD_WORKERS", 0),
             }
         )
 
@@ -203,3 +223,10 @@ class AppConfig:
         if self.web_download_workers <= 0:
             return self.max_download_workers()
         return max(1, min(self.web_download_workers, self.max_download_workers()))
+
+    def effective_single_file_download_workers(self) -> int:
+        if not self.single_file_parallel_enabled:
+            return 1
+        if self.single_file_download_workers <= 0:
+            return DEFAULT_SINGLE_FILE_DOWNLOAD_WORKERS
+        return max(1, min(self.single_file_download_workers, self.max_download_workers()))

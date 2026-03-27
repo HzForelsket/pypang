@@ -4,8 +4,10 @@ import hashlib
 import io
 import json
 import logging
+import math
 import posixpath
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -27,6 +29,8 @@ NETDISK_APP_ID = 250528
 DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024
 FIRST_SLICE_SIZE = 256 * 1024
 DEFAULT_DOWNLOAD_WORKERS = 4
+DEFAULT_SINGLE_FILE_DOWNLOAD_WORKERS = 4
+MIN_SINGLE_FILE_PARALLEL_SIZE = 8 * 1024 * 1024
 CHECKSUM_READ_SIZE = 8 * 1024 * 1024
 logger = logging.getLogger(__name__)
 MD5_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -104,6 +108,14 @@ class BaiduPanClient:
 
     def download_worker_count(self) -> int:
         workers = getattr(self.config, "effective_cli_download_workers", lambda: DEFAULT_DOWNLOAD_WORKERS)()
+        return max(1, int(workers))
+
+    def single_file_download_worker_count(self) -> int:
+        workers = getattr(
+            self.config,
+            "effective_single_file_download_workers",
+            lambda: DEFAULT_SINGLE_FILE_DOWNLOAD_WORKERS,
+        )()
         return max(1, int(workers))
 
     def account_membership_tier(self) -> str:
@@ -611,12 +623,14 @@ class BaiduPanClient:
         *,
         byte_range: str | None = None,
         spec: DownloadSpec | None = None,
+        session: requests.Session | None = None,
     ) -> tuple[DownloadSpec, requests.Response]:
         spec = spec or self.build_download_spec(fs_id)
+        client = session or self.session
         headers = self._download_headers()
         if byte_range:
             headers["Range"] = byte_range
-        response = self.session.get(
+        response = client.get(
             spec.dlink,
             headers=headers,
             stream=True,
@@ -631,7 +645,7 @@ class BaiduPanClient:
             final_headers = self._base_headers()
             if byte_range:
                 final_headers["Range"] = byte_range
-            response = self.session.get(
+            response = client.get(
                 location,
                 headers=final_headers,
                 stream=True,
@@ -754,6 +768,161 @@ class BaiduPanClient:
             )
         logger.info("MD5 verify passed for %s", label)
 
+    def _should_parallel_download_single_file(
+        self,
+        *,
+        expected_size: int,
+        offset: int,
+        single_file_parallel: bool | None,
+    ) -> bool:
+        if single_file_parallel is False:
+            return False
+        if offset:
+            return False
+        if expected_size < MIN_SINGLE_FILE_PARALLEL_SIZE:
+            return False
+        if self.single_file_download_worker_count() <= 1:
+            return False
+        enabled = bool(getattr(self.config, "single_file_parallel_enabled", True))
+        return enabled if single_file_parallel is None else bool(single_file_parallel)
+
+    def _parallel_download_part_ranges(
+        self,
+        expected_size: int,
+        requested_workers: int,
+    ) -> list[tuple[int, int]]:
+        if expected_size <= 0:
+            return []
+        max_useful_workers = max(1, math.ceil(expected_size / MIN_SINGLE_FILE_PARALLEL_SIZE))
+        worker_count = max(1, min(requested_workers, max_useful_workers))
+        if worker_count <= 1:
+            return []
+        base_size = expected_size // worker_count
+        remainder = expected_size % worker_count
+        ranges: list[tuple[int, int]] = []
+        start = 0
+        for index in range(worker_count):
+            part_size = base_size + (1 if index < remainder else 0)
+            end = start + part_size - 1
+            ranges.append((start, end))
+            start = end + 1
+        return [item for item in ranges if item[0] <= item[1]]
+
+    def _supports_parallel_download(self, fs_id: int, spec: DownloadSpec) -> bool:
+        try:
+            _, response = self.open_download(
+                fs_id,
+                byte_range="bytes=0-0",
+                spec=spec,
+            )
+        except ApiError:
+            return False
+        try:
+            return response.status_code == 206 and "Content-Range" in response.headers
+        finally:
+            response.close()
+
+    def _download_file_in_parallel(
+        self,
+        fs_id: int,
+        *,
+        spec: DownloadSpec,
+        expected_size: int,
+        partial_target: Path,
+        label: str,
+        progress_callback: DownloadProgressCallback | None = None,
+    ) -> bool:
+        ranges = self._parallel_download_part_ranges(
+            expected_size,
+            self.single_file_download_worker_count(),
+        )
+        if len(ranges) <= 1:
+            return False
+        if not self._supports_parallel_download(fs_id, spec):
+            logger.info("Parallel download is not supported for %s, falling back to single stream", label)
+            return False
+
+        part_progress = [0 for _ in ranges]
+        part_targets = [partial_target.with_name(f"{partial_target.name}.part{index}") for index in range(len(ranges))]
+        progress_lock = threading.Lock()
+
+        for part_target in part_targets:
+            part_target.unlink(missing_ok=True)
+        partial_target.unlink(missing_ok=True)
+
+        def report(index: int, delta: int) -> None:
+            with progress_lock:
+                part_progress[index] += delta
+                downloaded_bytes = sum(part_progress)
+            self._report_download_progress(
+                progress_callback,
+                phase="downloading",
+                label=label,
+                downloaded_bytes=downloaded_bytes,
+                download_total_bytes=expected_size,
+                download_delta_bytes=delta,
+            )
+
+        def worker(index: int, start: int, end: int) -> None:
+            byte_range = f"bytes={start}-{end}"
+            session = requests.Session()
+            try:
+                _, response = self.open_download(
+                    fs_id,
+                    byte_range=byte_range,
+                    spec=spec,
+                    session=session,
+                )
+                try:
+                    if response.status_code != 206:
+                        raise ApiError(
+                            f"Parallel download was rejected for {spec.file_name}: HTTP {response.status_code}",
+                            code=response.status_code,
+                        )
+                    with part_targets[index].open("wb") as handle:
+                        for chunk in response.iter_content(chunk_size=1024 * 1024):
+                            if not chunk:
+                                continue
+                            handle.write(chunk)
+                            report(index, len(chunk))
+                finally:
+                    response.close()
+            except Exception:
+                raise
+            finally:
+                session.close()
+
+        try:
+            with ThreadPoolExecutor(max_workers=len(ranges)) as executor:
+                futures = [
+                    executor.submit(worker, index, start, end)
+                    for index, (start, end) in enumerate(ranges)
+                ]
+                for future in futures:
+                    future.result()
+
+            with partial_target.open("wb") as merged:
+                for index, (start, end) in enumerate(ranges):
+                    expected_part_size = end - start + 1
+                    actual_part_size = part_targets[index].stat().st_size if part_targets[index].exists() else 0
+                    if actual_part_size != expected_part_size:
+                        raise ApiError(
+                            f"Parallel download incomplete for {spec.file_name} part {index}: expected {expected_part_size} bytes, got {actual_part_size}",
+                        )
+                    with part_targets[index].open("rb") as part_handle:
+                        for chunk in iter(lambda: part_handle.read(1024 * 1024), b""):
+                            if chunk:
+                                merged.write(chunk)
+        except Exception:
+            partial_target.unlink(missing_ok=True)
+            for part_target in part_targets:
+                part_target.unlink(missing_ok=True)
+            raise
+        else:
+            for part_target in part_targets:
+                part_target.unlink(missing_ok=True)
+            return True
+
     def download_file(
         self,
         remote_path: str,
@@ -762,6 +931,7 @@ class BaiduPanClient:
         resume: bool = True,
         progress_callback: DownloadProgressCallback | None = None,
         parallel: bool = True,
+        single_file_parallel: bool | None = None,
     ) -> Path:
         entry = self.get_entry_by_path(remote_path)
         if bool(entry.get("isdir")):
@@ -771,12 +941,14 @@ class BaiduPanClient:
                 resume=resume,
                 progress_callback=progress_callback,
                 parallel=parallel,
+                single_file_parallel=single_file_parallel,
             )
         return self._download_entry_to_path(
             entry,
             destination,
             resume=resume,
             progress_callback=progress_callback,
+            single_file_parallel=single_file_parallel,
         )
 
     def download_directory(
@@ -787,6 +959,7 @@ class BaiduPanClient:
         resume: bool = True,
         progress_callback: DownloadProgressCallback | None = None,
         parallel: bool = True,
+        single_file_parallel: bool | None = None,
     ) -> Path:
         entry = self.get_entry_by_path(remote_path)
         if not bool(entry.get("isdir")):
@@ -826,6 +999,7 @@ class BaiduPanClient:
                     local_target,
                     resume=resume,
                     progress_callback=progress_callback,
+                    single_file_parallel=single_file_parallel,
                 )
             return target_root
 
@@ -838,6 +1012,7 @@ class BaiduPanClient:
                     local_target,
                     resume=resume,
                     progress_callback=progress_callback,
+                    single_file_parallel=single_file_parallel,
                 )
                 for child, local_target in file_jobs
             ]
@@ -852,6 +1027,7 @@ class BaiduPanClient:
         *,
         resume: bool = True,
         progress_callback: DownloadProgressCallback | None = None,
+        single_file_parallel: bool | None = None,
     ) -> Path:
         fs_id = int(entry["fs_id"])
         file_name = str(entry.get("server_filename") or Path(str(entry.get("path", ""))).name or "download.bin")
@@ -946,6 +1122,39 @@ class BaiduPanClient:
             downloaded_bytes=offset,
             download_total_bytes=expected_size,
         )
+        if self._should_parallel_download_single_file(
+            expected_size=expected_size,
+            offset=offset,
+            single_file_parallel=single_file_parallel,
+        ):
+            logger.info("Start parallel download for %s with workers=%s", label, self.single_file_download_worker_count())
+            if self._download_file_in_parallel(
+                fs_id,
+                spec=spec,
+                expected_size=expected_size,
+                partial_target=partial_target,
+                label=label,
+                progress_callback=progress_callback,
+            ):
+                self._ensure_download_md5(
+                    partial_target,
+                    spec=spec,
+                    label=label,
+                    progress_callback=progress_callback,
+                )
+                partial_target.replace(target)
+                self._report_download_progress(
+                    progress_callback,
+                    phase="completed",
+                    label=label,
+                    downloaded_bytes=expected_size,
+                    download_total_bytes=expected_size,
+                    verify_bytes=expected_size,
+                    verify_total_bytes=expected_size,
+                )
+                logger.info("Parallel download completed for %s -> %s", label, target)
+                return target
+
         byte_range = f"bytes={offset}-" if offset else None
         logger.info("Start network download for %s with offset=%s", label, offset)
         spec, response = self.open_download(fs_id, byte_range=byte_range, spec=spec)
@@ -1019,6 +1228,7 @@ class BaiduPanClient:
         resume: bool = True,
         progress_callback: Callable[[int, int, str], None] | None = None,
         parallel: bool = True,
+        single_file_parallel: bool | None = None,
     ) -> list[Path]:
         base = Path(destination_root)
         if base.exists() and base.is_file():
@@ -1037,6 +1247,7 @@ class BaiduPanClient:
                     resume=resume,
                     progress_callback=progress_callback,
                     parallel=parallel,
+                    single_file_parallel=single_file_parallel,
                 )
             )
         return results

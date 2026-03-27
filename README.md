@@ -28,6 +28,7 @@
 - 默认应用目录为 `/apps/bypy`
 - 默认授权方式为 `oob`
 - 默认按无会员档位运行；上传分片默认跟随账号身份自动取最高可用值，CLI/Web 下载并发默认取 `8`
+- 单文件下载默认开启分段并发，默认连接数为 `4`，不支持 `Range` 的链路会自动回退为单连接下载
 
 如果存在 `config.json`：
 
@@ -154,6 +155,12 @@ pypang config set --listen-host 0.0.0.0 --listen-port 8080
 pypang config set --membership-tier vip --upload-chunk-mb 16 --cli-download-workers 4 --web-download-workers 4
 ```
 
+如果要调整单文件并发下载：
+
+```powershell
+pypang config set --single-file-parallel-enabled --single-file-download-workers 4
+```
+
 ### 3. 获取授权链接
 
 ```powershell
@@ -218,6 +225,12 @@ pypang get /apps/bypy/docs/remote.txt .\downloads\
 ```
 
 下载命令默认支持断点续传；如果希望强制重新开始，可追加 `--no-resume`。
+
+单文件下载默认会尝试分段并发；如果某次下载希望临时关闭，可追加：
+
+```powershell
+pypang get /apps/bypy/docs/remote.txt .\downloads\ --no-single-file-parallel
+```
 
 重命名：
 
