@@ -86,43 +86,6 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-## 发布到 PyPI
-
-发布前先更新 [`pyproject.toml`](/home/huangzhong/pypan/pyproject.toml) 和 [`pypang/__init__.py`](/home/huangzhong/pypan/pypang/__init__.py) 中的版本号，然后执行：
-
-```powershell
-rm -rf build dist *.egg-info
-python -m pip install --upgrade build twine
-python -m build
-python -m twine check dist/*
-python -m twine upload dist/*
-```
-
-## GitHub Actions 发布
-
-仓库已包含两个工作流：
-
-- `CI`：在 push / pull request 时执行 `build` 和 `twine check`
-- `Publish`：支持手动发布到 TestPyPI；推送版本 tag 后会自动发布到正式 PyPI
-
-使用前请先在 GitHub 仓库 `Settings -> Secrets and variables -> Actions` 中配置：
-
-- `TEST_PYPI_API_TOKEN`
-- `PYPI_API_TOKEN`
-
-手动发布步骤：
-
-1. 进入 GitHub 仓库的 `Actions -> Publish`
-2. 点击 `Run workflow`
-3. 选择 `testpypi` 并运行
-
-自动正式发布步骤：
-
-1. 更新版本号并推送代码
-2. 创建并推送版本 tag，例如 `v0.1.2`
-3. `Publish` 工作流会先校验 tag、[`pyproject.toml`](/home/huangzhong/pypan/pyproject.toml) 和 [`pypang/__init__.py`](/home/huangzhong/pypan/pypang/__init__.py) 中的版本是否一致
-4. 校验通过后自动构建并上传到 PyPI
-
 ## 首次配置
 
 通过 `pip install pypang` 安装后，不需要修改 `site-packages` 里的文件。
@@ -301,29 +264,6 @@ pypang serve --host 127.0.0.1 --port 8080
 
 ```text
 http://127.0.0.1:8080
-```
-
-## 打包与发布
-
-构建 PyPI 包：
-
-```powershell
-python -m pip install --upgrade build twine
-python -m build
-```
-
-构建产物会出现在 `dist/` 目录。
-
-发布前检查：
-
-```powershell
-python -m twine check dist/*
-```
-
-上传到 PyPI：
-
-```powershell
-python -m twine upload dist/*
 ```
 
 ### 无图形界面服务器启动
