@@ -100,7 +100,13 @@ pypang config set --app-key your-app-key --secret-key your-secret-key --app-name
 配置会保存到本地运行状态文件中，默认路径为：
 
 ```text
-.runtime/state.json
+~/.pypang/state.json
+```
+
+上传过程中用到的临时文件默认保存在：
+
+```text
+~/.pypang/tmp
 ```
 
 如果你更习惯使用 `config.json`，可以在当前运行目录手动放置一个文件，例如：

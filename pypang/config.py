@@ -9,8 +9,7 @@ from typing import Any
 
 
 DEFAULT_REDIRECT_URI = "oob"
-DEFAULT_STATE_PATH = Path(".runtime/state.json")
-DEFAULT_TEMP_DIR = Path(".runtime/tmp")
+DEFAULT_APP_HOME_DIRNAME = ".pypang"
 DEFAULT_LEGACY_CONFIG_PATH = Path("config.json")
 DEFAULT_MEMBERSHIP_TIER = "free"
 DEFAULT_SINGLE_FILE_DOWNLOAD_WORKERS = 4
@@ -40,19 +39,31 @@ def _coerce_bool(value: Any, default: bool) -> bool:
     return bool(value)
 
 
+def user_home_dir() -> Path:
+    return Path.home() / DEFAULT_APP_HOME_DIRNAME
+
+
+def default_runtime_state_path() -> Path:
+    return user_home_dir() / "state.json"
+
+
+def default_runtime_temp_dir() -> Path:
+    return user_home_dir() / "tmp"
+
+
 def runtime_state_path() -> Path:
     raw = os.getenv("BAIDUPANWEB_STATE_PATH")
-    return Path(raw) if raw else DEFAULT_STATE_PATH
+    return Path(raw).expanduser() if raw else default_runtime_state_path()
 
 
 def runtime_temp_dir() -> Path:
     raw = os.getenv("BAIDUPANWEB_TEMP_DIR")
-    return Path(raw) if raw else DEFAULT_TEMP_DIR
+    return Path(raw).expanduser() if raw else default_runtime_temp_dir()
 
 
 def legacy_config_path() -> Path:
     raw = os.getenv("BAIDUPANWEB_LEGACY_CONFIG")
-    return Path(raw) if raw else DEFAULT_LEGACY_CONFIG_PATH
+    return Path(raw).expanduser() if raw else DEFAULT_LEGACY_CONFIG_PATH
 
 
 @dataclass(slots=True)
