@@ -1,0 +1,13 @@
+.runtime/
+.doccache/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+config.json

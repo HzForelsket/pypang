@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pypang"
+version = "0.1.1"
+description = "Baidu Netdisk client with CLI commands and a matching FastAPI Web UI."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "huangzhong" }
+]
+maintainers = [
+  { name = "huangzhong" }
+]
+keywords = ["baidu", "baidupan", "netdisk", "fastapi", "cli"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Environment :: Web Environment",
+  "Framework :: FastAPI",
+  "Intended Audience :: End Users/Desktop",
+  "Intended Audience :: System Administrators",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Internet",
+  "Topic :: System :: Archiving",
+  "Topic :: Utilities",
+]
+dependencies = [
+  "fastapi>=0.115,<1.0",
+  "jinja2>=3.1,<4.0",
+  "python-multipart>=0.0.9,<1.0",
+  "requests>=2.32,<3.0",
+  "uvicorn>=0.32,<1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/HzForelsket/BaiduPanWeb"
+Repository = "https://github.com/HzForelsket/BaiduPanWeb"
+Issues = "https://github.com/HzForelsket/BaiduPanWeb/issues"
+
+[project.scripts]
+pypang = "pypang.cli:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["pypang*"]
+
+[tool.setuptools.package-data]
+pypang = ["templates/*.html", "static/*.css", "static/*.js", "app.list.json"]

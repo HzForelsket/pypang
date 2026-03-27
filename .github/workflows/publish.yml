@@ -1,0 +1,132 @@
+name: Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "Target package index"
+        required: true
+        default: "testpypi"
+        type: choice
+        options:
+          - testpypi
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      repository: ${{ steps.target.outputs.repository }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve target repository
+        id: target
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "repository=pypi" >> "$GITHUB_OUTPUT"
+          else
+            echo "repository=${{ inputs.repository }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate release version
+        if: steps.target.outputs.repository == 'pypi'
+        run: |
+          python - <<'PY'
+          import pathlib
+          import re
+          import tomllib
+
+          pyproject = tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))
+          project_version = str(pyproject["project"]["version"]).strip()
+
+          init_text = pathlib.Path("pypang/__init__.py").read_text(encoding="utf-8")
+          match = re.search(r'__version__\s*=\s*"([^"]+)"', init_text)
+          if not match:
+              raise SystemExit("Could not find __version__ in pypang/__init__.py")
+          init_version = match.group(1).strip()
+
+          ref = "${{ github.ref_name }}"
+          tag_version = ref[1:] if ref.startswith("v") else ref
+
+          mismatches = []
+          if project_version != tag_version:
+              mismatches.append(f"pyproject.toml version {project_version!r} != tag {tag_version!r}")
+          if init_version != tag_version:
+              mismatches.append(f"pypang/__init__.py version {init_version!r} != tag {tag_version!r}")
+
+          if mismatches:
+              raise SystemExit("Version check failed:\n- " + "\n- ".join(mismatches))
+
+          print(f"Version check passed for tag {ref}")
+          PY
+
+      - name: Clean old build artifacts
+        run: rm -rf build dist *.egg-info
+
+      - name: Install build tools
+        run: python -m pip install --upgrade pip build twine
+
+      - name: Build distributions
+        run: python -m build
+
+      - name: Check distributions
+        run: python -m twine check dist/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+
+  publish-testpypi:
+    needs: build
+    if: needs.build.outputs.repository == 'testpypi'
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          user: __token__
+          password: ${{ secrets.TEST_PYPI_API_TOKEN }}
+
+  publish-pypi:
+    needs: build
+    if: needs.build.outputs.repository == 'pypi'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          user: __token__
+          password: ${{ secrets.PYPI_API_TOKEN }}

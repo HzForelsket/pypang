@@ -1,0 +1,277 @@
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+
+
+from . import __version__
+from .client import BaiduPanClient
+from .config import AppConfig
+from .errors import BaiduPanError
+from .storage import StateStore
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="pypang",
+        description="Baidu Pan client with a matching Web UI.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    config_cmd = sub.add_parser("config", help="Show or update local configuration.")
+    config_sub = config_cmd.add_subparsers(dest="config_command", required=True)
+    config_sub.add_parser("show", help="Print the current configuration.")
+    config_set = config_sub.add_parser("set", help="Update configuration fields.")
+    config_set.add_argument("--app-key")
+    config_set.add_argument("--secret-key")
+    config_set.add_argument("--app-id")
+    config_set.add_argument("--app-name")
+    config_set.add_argument("--app-root")
+    config_set.add_argument("--redirect-uri")
+    config_set.add_argument("--listen-host")
+    config_set.add_argument("--listen-port", type=int)
+    config_set.add_argument("--user-agent")
+    config_set.add_argument("--scope")
+    config_set.add_argument("--membership-tier", choices=["free", "vip", "svip"])
+    config_set.add_argument("--upload-chunk-mb", type=int)
+    config_set.add_argument("--cli-download-workers", type=int)
+    config_set.add_argument("--web-download-workers", type=int)
+
+    auth_cmd = sub.add_parser("auth", help="Authorization helpers.")
+    auth_sub = auth_cmd.add_subparsers(dest="auth_command", required=True)
+    auth_sub.add_parser("url", help="Print the Baidu OAuth authorization URL.")
+    auth_code = auth_sub.add_parser("code", help="Exchange an authorization code.")
+    auth_code.add_argument("code")
+    auth_sub.add_parser("refresh", help="Refresh the access token.")
+    auth_sub.add_parser("logout", help="Remove the local access token.")
+
+    serve_cmd = sub.add_parser("serve", help="Run the Web UI server.")
+    serve_cmd.add_argument("--host")
+    serve_cmd.add_argument("--port", type=int)
+    serve_cmd.add_argument("--reload", action="store_true")
+
+    sub.add_parser("info", help="Show the authorized user info.")
+    sub.add_parser("quota", help="Show the current quota usage.")
+
+    list_cmd = sub.add_parser("list", help="List files under a remote directory.")
+    list_cmd.add_argument("path", nargs="?", default="/")
+
+    ls_cmd = sub.add_parser("ls", help="Alias of list.")
+    ls_cmd.add_argument("path", nargs="?", default="/")
+
+    mkdir_cmd = sub.add_parser("mkdir", help="Create a remote directory.")
+    mkdir_cmd.add_argument("path")
+    mkdir_cmd.add_argument("--rename-on-conflict", action="store_true")
+
+    upload_cmd = sub.add_parser("upload", help="Upload a local file to a remote file or directory.")
+    upload_cmd.add_argument("local_path")
+    upload_cmd.add_argument("remote_path", nargs="?")
+    upload_cmd.add_argument(
+        "--policy",
+        choices=["fail", "rename", "smart", "overwrite"],
+        default="overwrite",
+    )
+    upload_cmd.add_argument("--single-step", action="store_true")
+
+    put_cmd = sub.add_parser("put", help="Alias of upload.")
+    put_cmd.add_argument("local_path")
+    put_cmd.add_argument("remote_path", nargs="?")
+    put_cmd.add_argument(
+        "--policy",
+        choices=["fail", "rename", "smart", "overwrite"],
+        default="overwrite",
+    )
+    put_cmd.add_argument("--single-step", action="store_true")
+
+    download_cmd = sub.add_parser("download", help="Download a remote file.")
+    download_cmd.add_argument("remote_path")
+    download_cmd.add_argument("destination", nargs="?")
+    download_cmd.add_argument("--no-resume", action="store_true")
+
+    get_cmd = sub.add_parser("get", help="Alias of download.")
+    get_cmd.add_argument("remote_path")
+    get_cmd.add_argument("destination", nargs="?")
+    get_cmd.add_argument("--no-resume", action="store_true")
+
+    rename_cmd = sub.add_parser("rename", help="Rename a remote file or folder.")
+    rename_cmd.add_argument("path")
+    rename_cmd.add_argument("new_name")
+
+    move_cmd = sub.add_parser("move", help="Move a remote file or folder.")
+    move_cmd.add_argument("path")
+    move_cmd.add_argument("destination_dir")
+    move_cmd.add_argument("--new-name")
+
+    mv_cmd = sub.add_parser("mv", help="Alias of move.")
+    mv_cmd.add_argument("path")
+    mv_cmd.add_argument("destination_dir")
+    mv_cmd.add_argument("--new-name")
+
+    delete_cmd = sub.add_parser("delete", help="Delete one or more remote paths.")
+    delete_cmd.add_argument("paths", nargs="+")
+
+    rm_cmd = sub.add_parser("rm", help="Alias of delete.")
+    rm_cmd.add_argument("paths", nargs="+")
+
+    sub.add_parser("whoami", help="Alias of info.")
+
+    return parser
+
+
+def _print_json(payload):
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    store = StateStore()
+    client = BaiduPanClient(store=store)
+
+    try:
+        if args.command == "config":
+            return _handle_config(store, args)
+        if args.command == "auth":
+            return _handle_auth(store, client, args)
+        if args.command == "serve":
+            return _handle_serve(store, args)
+        if args.command == "whoami":
+            _print_json(client.get_user_info())
+            return 0
+        if args.command == "info":
+            _print_json(client.get_user_info())
+            return 0
+        if args.command == "quota":
+            _print_json(client.get_quota())
+            return 0
+        if args.command in {"list", "ls"}:
+            _print_json(client.list_files(args.path))
+            return 0
+        if args.command == "mkdir":
+            _print_json(
+                client.create_folder(args.path, rename_on_conflict=args.rename_on_conflict)
+            )
+            return 0
+        if args.command in {"upload", "put"}:
+            _print_json(
+                client.upload_file(
+                    args.local_path,
+                    args.remote_path,
+                    policy=args.policy,
+                    prefer_single_step=args.single_step,
+                )
+            )
+            return 0
+        if args.command in {"download", "get"}:
+            target = client.download_file(
+                args.remote_path,
+                args.destination,
+                resume=not args.no_resume,
+            )
+            print(target)
+            return 0
+        if args.command == "rename":
+            _print_json(client.rename(args.path, args.new_name))
+            return 0
+        if args.command in {"move", "mv"}:
+            _print_json(client.move(args.path, args.destination_dir, new_name=args.new_name))
+            return 0
+        if args.command in {"delete", "rm"}:
+            _print_json(client.delete(args.paths))
+            return 0
+    except BaiduPanError as exc:
+        print(f"Error: {exc}")
+        return 1
+
+    parser.print_help()
+    return 1
+
+
+def _handle_config(store: StateStore, args) -> int:
+    state = store.load()
+    if args.config_command == "show":
+        _print_json(state.to_dict())
+        return 0
+
+    data = state.config.to_dict()
+    changed = False
+    for field in (
+        "app_key",
+        "secret_key",
+        "app_id",
+        "app_name",
+        "app_root",
+        "redirect_uri",
+        "listen_host",
+        "listen_port",
+        "user_agent",
+        "scope",
+        "membership_tier",
+        "upload_chunk_mb",
+        "cli_download_workers",
+        "web_download_workers",
+    ):
+        value = getattr(args, field, None)
+        if value not in (None, ""):
+            data[field] = value
+            changed = True
+
+    if not changed:
+        print("No values changed.")
+        return 0
+
+    auth_fields = {"app_key", "secret_key", "app_id", "app_name", "app_root", "redirect_uri", "scope"}
+    clear_token = any(
+        getattr(args, field, None) not in (None, "")
+        for field in auth_fields
+    )
+    store.update_config(AppConfig.from_dict(data), clear_token=clear_token)
+    print(store.path)
+    return 0
+
+
+
+
+def _handle_serve(store: StateStore, args) -> int:
+    try:
+        import uvicorn
+    except ModuleNotFoundError as exc:
+        raise BaiduPanError("uvicorn is required for the Web UI. Install dependencies with pip install -r requirements.txt.") from exc
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
+    config = store.load().config
+    host = args.host or config.listen_host or "127.0.0.1"
+    port = args.port or config.listen_port or 8080
+    uvicorn.run(
+        "pypang.app:app",
+        host=host,
+        port=int(port),
+        reload=bool(args.reload),
+    )
+    return 0
+
+
+def _handle_auth(store: StateStore, client: BaiduPanClient, args) -> int:
+    if args.auth_command == "url":
+        print(client.build_authorize_url())
+        return 0
+    if args.auth_command == "code":
+        _print_json(client.exchange_code(args.code).to_dict())
+        return 0
+    if args.auth_command == "refresh":
+        _print_json(client.refresh_access_token().to_dict())
+        return 0
+    if args.auth_command == "logout":
+        store.clear_token()
+        print("Token cleared.")
+        return 0
+    return 1

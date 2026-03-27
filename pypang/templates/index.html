@@ -1,0 +1,595 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero hero-compact">
+  <div class="hero-copy">
+    <div class="hero-main">
+      <p class="eyebrow">Workspace</p>
+      <h1>&#32593;&#30424;&#25991;&#20214;&#27983;&#35272;&#22120;</h1>
+      <p class="hero-text compact">
+        &#40664;&#35748;&#20860;&#23481; bypy &#25480;&#26435;&#65292;&#21487;&#20999;&#25442;&#33258;&#23450;&#20041;&#24212;&#29992;&#37197;&#32622;&#65292;&#25903;&#25345; OOB &#25480;&#26435;&#19982;&#24120;&#29992;&#25991;&#20214;&#31649;&#29702;&#25805;&#20316;&#12290;
+      </p>
+    </div>
+    <div class="hero-links">
+      <button id="open-control-center-button" class="button primary" type="button">连接中心</button>
+      <a class="button ghost" href="{{ bootstrap.bypy_reference.url }}" target="_blank" rel="noreferrer">bypy &#21442;&#32771;</a>
+      <a class="button ghost" href="{{ bootstrap.official_docs[0].url }}" target="_blank" rel="noreferrer">&#30334;&#24230;&#32593;&#30424;&#25991;&#26723;</a>
+      <div class="hero-root-chip">
+        <span>&#24403;&#21069;&#27983;&#35272;&#33539;&#22260;</span>
+        <strong id="hero-app-root">/apps/bypy</strong>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="workspace">
+  <div class="main-column">
+    <section class="browser panel">
+      <div class="browser-head">
+        <div>
+          <p class="eyebrow">Workspace</p>
+          <h2>文件浏览</h2>
+        </div>
+        <div class="browser-actions">
+          <button id="create-folder-button" class="button ghost" type="button">新建目录</button>
+          <button id="open-selected-button" class="button ghost" type="button">打开选中</button>
+          <button id="download-selected-button" class="button ghost" type="button">下载选中</button>
+          <button id="download-server-button" class="button ghost" type="button">&#20445;&#23384;&#21040;&#26381;&#21153;&#22120;</button>
+          <button id="rename-selected-button" class="button ghost" type="button">重命名</button>
+          <button id="move-selected-button" class="button ghost" type="button">移动</button>
+          <button id="reload-button" class="button ghost" type="button">刷新列表</button>
+          <button id="delete-selected-button" class="button ghost danger" type="button">删除选中</button>
+        </div>
+      </div>
+
+      <div class="notice" id="notice-bar">
+        保存配置后点“前往百度授权”，完成一次授权后即可浏览 <code>/apps/你的应用目录</code>。
+      </div>
+
+      <div id="breadcrumbs" class="breadcrumbs"></div>
+
+      <div class="table-wrap">
+        <table class="file-table">
+          <thead>
+            <tr>
+              <th class="fit"><input id="select-all" type="checkbox" /></th>
+              <th>名称</th>
+              <th class="fit">类型</th>
+              <th class="fit">大小</th>
+              <th class="fit">修改时间</th>
+            </tr>
+          </thead>
+          <tbody id="file-table-body">
+            <tr>
+              <td colspan="5" class="empty-state">等待加载文件列表…</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <aside class="tool-rail">
+    <section class="panel profile-panel">
+      <div class="panel-head">
+        <div>
+          <p class="eyebrow">Profile</p>
+          <h2>账号概览</h2>
+        </div>
+      </div>
+      <div class="profile-card">
+        <div class="avatar-shell">
+          <img id="avatar-image" alt="avatar" />
+        </div>
+        <div class="profile-meta">
+          <strong id="profile-name">等待授权</strong>
+          <span id="profile-vip">未连接</span>
+          <span id="profile-uk">UK: -</span>
+        </div>
+      </div>
+      <div class="quota-card">
+        <div class="quota-track">
+          <div id="quota-bar" class="quota-bar"></div>
+        </div>
+        <div class="quota-meta">
+          <span id="quota-used">已用 -</span>
+          <span id="quota-total">总量 -</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="ops-panel">
+      <div class="panel-head">
+        <div>
+          <p class="eyebrow">Upload</p>
+          <h2>上传</h2>
+        </div>
+      </div>
+      <form id="upload-form" class="stack-form tight">
+        <input id="upload-target-path" type="hidden" />
+        <div class="upload-summary-grid">
+          <article class="upload-summary-item wide">
+            <span>网盘地址</span>
+            <div class="summary-row">
+              <strong id="upload-target-summary">当前目录</strong>
+              <button id="open-upload-target-button" class="button ghost" type="button">选项</button>
+            </div>
+          </article>
+          <article class="upload-summary-item wide">
+            <span>文件路径</span>
+            <div class="summary-row">
+              <strong id="upload-source-summary">未选择</strong>
+              <button id="open-upload-source-button" class="button ghost" type="button">选项</button>
+            </div>
+          </article>
+        </div>
+        <input id="upload-files" type="file" multiple hidden />
+        <input id="upload-folders" type="file" webkitdirectory directory multiple hidden />
+        <button class="button accent" type="submit">上传</button>
+      </form>
+    </section>
+  </aside>
+</section>
+
+<section id="download-speed-card" class="panel download-speed-card">
+  <details id="download-speed-details" open>
+    <summary class="download-speed-summary">
+      <div>
+        <p class="eyebrow">Transfer Monitor</p>
+        <h2>传输</h2>
+      </div>
+      <div class="download-speed-meta">
+        <strong id="transfer-overview-title">空闲</strong>
+        <span id="transfer-overview-percent">0%</span>
+      </div>
+      <div class="quota-track">
+        <div id="transfer-overview-bar" class="quota-bar"></div>
+      </div>
+      <div class="transfer-overview-text">
+        <span id="transfer-overview-detail">暂无任务</span>
+      </div>
+    </summary>
+    <div class="download-speed-body">
+      <details id="upload-monitor-details" class="transfer-subcard" open>
+        <summary class="download-speed-summary transfer-subcard-summary">
+          <div>
+            <p class="eyebrow">Upload</p>
+            <h2>上传</h2>
+          </div>
+          <div class="download-speed-meta">
+            <strong id="upload-summary-text">待机</strong>
+            <span id="upload-summary-percent">0%</span>
+          </div>
+          <div class="quota-track">
+            <div id="upload-progress-bar" class="quota-bar"></div>
+          </div>
+        </summary>
+        <div class="transfer-subcard-body">
+          <div id="upload-progress-wrap" class="progress-wrap" hidden>
+            <span id="upload-progress-text">暂无上传</span>
+          </div>
+          <div class="download-file-empty" id="upload-progress-empty">暂无上传</div>
+        </div>
+      </details>
+      <details id="download-monitor-details" class="transfer-subcard" open>
+        <summary class="download-speed-summary transfer-subcard-summary">
+          <div>
+            <p class="eyebrow">Download</p>
+            <h2>下载</h2>
+          </div>
+          <div class="download-speed-meta">
+            <strong id="download-speed-total">0 B/s</strong>
+            <span id="download-progress-text">0%</span>
+          </div>
+          <div class="quota-track">
+            <div id="server-download-progress-bar" class="quota-bar"></div>
+          </div>
+        </summary>
+        <div class="transfer-subcard-body">
+          <div class="download-speed-total-line" id="server-download-progress-text">暂无下载</div>
+          <div class="download-speed-columns">
+            <section class="download-speed-column">
+              <div class="panel-head compact">
+                <div>
+                  <p class="eyebrow">Active</p>
+                  <h2>进行中</h2>
+                </div>
+              </div>
+              <div id="download-active-list" class="download-file-list"></div>
+            </section>
+            <section class="download-speed-column">
+              <div class="panel-head compact">
+                <div>
+                  <p class="eyebrow">Queue</p>
+                  <h2>等待中</h2>
+                </div>
+              </div>
+              <div id="download-waiting-list" class="download-file-list"></div>
+            </section>
+            <section class="download-speed-column">
+              <div class="panel-head compact">
+                <div>
+                  <p class="eyebrow">Done</p>
+                  <h2>已完成</h2>
+                </div>
+              </div>
+              <div id="download-completed-list" class="download-file-list"></div>
+            </section>
+          </div>
+        </div>
+      </details>
+    </div>
+  </details>
+</section>
+
+<section class="panel docs-band">
+  <div class="panel-head">
+    <div>
+      <p class="eyebrow">References</p>
+      <h2>适配依据</h2>
+    </div>
+  </div>
+  <div id="doc-list" class="doc-list doc-list-horizontal"></div>
+</section>
+
+<dialog id="upload-target-dialog" class="dialog-shell upload-target-dialog">
+  <div class="dialog-form upload-target-dialog-form">
+    <div class="panel-head">
+      <div>
+        <p class="eyebrow">Remote</p>
+        <h2>网盘地址</h2>
+      </div>
+      <div class="auth-actions">
+        <button class="button ghost" type="button" data-close-dialog="upload-target-dialog">关闭</button>
+      </div>
+    </div>
+    <section class="browser-like-panel">
+      <div class="browser-head compact-browser-head">
+        <div>
+          <p class="eyebrow">Remote</p>
+          <h2>目录选择</h2>
+        </div>
+        <div class="browser-actions">
+          <button id="upload-target-use-current-button" class="button ghost" type="button">当前目录</button>
+          <button id="upload-target-confirm-button" class="button accent" type="button">确定</button>
+        </div>
+      </div>
+      <div class="browser-toolbar">
+        <div class="notice upload-browser-notice">
+          <span>已选:</span>
+          <strong id="upload-target-selection-text">默认当前目录</strong>
+        </div>
+      </div>
+      <div id="upload-target-breadcrumbs" class="breadcrumbs upload-target-breadcrumbs"></div>
+      <div class="table-wrap browser-picker-table">
+        <table class="file-table">
+          <thead>
+            <tr>
+              <th>名称</th>
+              <th>类型</th>
+              <th class="fit">操作</th>
+            </tr>
+          </thead>
+          <tbody id="upload-target-list">
+            <tr>
+              <td colspan="3" class="empty-state">加载中…</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+</dialog>
+
+<dialog id="upload-source-dialog" class="dialog-shell upload-center-dialog">
+  <div class="dialog-form upload-center-content">
+    <div class="panel-head">
+      <div>
+        <p class="eyebrow">Source</p>
+        <h2>文件路径</h2>
+      </div>
+      <div class="auth-actions">
+        <button class="button ghost" type="button" data-close-dialog="upload-source-dialog">关闭</button>
+      </div>
+    </div>
+    <div class="stack-form">
+      <label>
+        <span>来源</span>
+        <select id="upload-source-location">
+          <option value="local">本机</option>
+          <option value="server">服务器</option>
+        </select>
+      </label>
+      <label>
+        <span>上传策略</span>
+        <select id="upload-policy" form="upload-form">
+          <option value="overwrite">覆盖同名文件</option>
+          <option value="rename">自动重命名</option>
+          <option value="smart">仅内容不同才重命名</option>
+          <option value="fail">冲突时报错</option>
+        </select>
+      </label>
+    </div>
+    <section class="browser-like-panel">
+      <div class="browser-head compact-browser-head">
+        <div>
+          <p class="eyebrow">Source</p>
+          <h2 id="upload-source-panel-title">本机路径</h2>
+        </div>
+        <div id="upload-source-local-actions" class="browser-actions">
+          <label class="toolbar-select">
+            <span>类型</span>
+            <select id="upload-local-kind">
+              <option value="file">文件</option>
+              <option value="folder">文件夹</option>
+            </select>
+          </label>
+          <button id="pick-local-source-button" class="button ghost" type="button">选择路径</button>
+        </div>
+      </div>
+      <div class="browser-toolbar single-line-toolbar">
+        <div class="notice upload-browser-notice">
+          <span>已选:</span>
+          <strong id="upload-source-selection-text">未选择</strong>
+        </div>
+      </div>
+      <div id="upload-source-server-panel" hidden>
+        <div id="upload-server-source-breadcrumbs" class="breadcrumbs upload-target-breadcrumbs"></div>
+        <div class="table-wrap browser-picker-table">
+          <table class="file-table">
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>类型</th>
+                <th class="fit">操作</th>
+              </tr>
+            </thead>
+            <tbody id="upload-server-source-list">
+              <tr>
+                <td colspan="3" class="empty-state">加载中…</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div id="upload-source-local-panel">
+        <div class="table-wrap browser-picker-table">
+          <table class="file-table">
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>类型</th>
+                <th class="fit">状态</th>
+              </tr>
+            </thead>
+            <tbody id="upload-local-selection-list">
+              <tr>
+                <td colspan="3" class="empty-state">未选择</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </div>
+</dialog>
+
+<dialog id="control-center-dialog" class="dialog-shell control-center-dialog">
+  <div class="dialog-form control-center-content">
+    <div class="panel-head">
+      <div>
+        <p class="eyebrow">Controls</p>
+        <h2>连接中心</h2>
+      </div>
+      <div class="auth-actions">
+        <button class="button primary" type="submit" form="settings-form">保存本地配置</button>
+        <button class="button ghost" type="button" data-close-dialog="control-center-dialog">关闭</button>
+      </div>
+    </div>
+    <div class="control-tree">
+      <details class="tree-section" open>
+        <summary>
+          <span class="tree-index">01</span>
+          <div>
+            <strong>连接配置</strong>
+            <span>预设、App 参数和授权入口</span>
+          </div>
+        </summary>
+        <div class="tree-body">
+          <form id="settings-form" class="stack-form">
+            <label>
+              <span>Preset</span>
+              <select id="app-preset" name="app_preset">
+                <option value="">Manual</option>
+              </select>
+            </label>
+            <label>
+              <span>App Key</span>
+              <input id="app-key" name="app_key" placeholder="百度开放平台 AppKey" />
+            </label>
+            <label>
+              <span>Secret Key</span>
+              <input id="secret-key" name="secret_key" type="password" placeholder="百度开放平台 SecretKey" />
+            </label>
+            <label>
+              <span>App ID</span>
+              <input id="app-id" name="app_id" placeholder="硬件应用才需要" />
+            </label>
+            <label>
+              <span>应用名称</span>
+              <input id="app-name" name="app_name" placeholder="用于推导 /apps/应用名称" />
+            </label>
+            <label>
+              <span>App Root</span>
+              <input id="app-root" name="app_root" placeholder="/apps/你的应用目录" />
+            </label>
+            <label>
+              <span>回调地址</span>
+              <input id="redirect-uri" name="redirect_uri" placeholder="oob" />
+            </label>
+          </form>
+          <p class="panel-note">
+            如果仓库根目录已经有 <code>config.json</code>，系统会自动读取里面的
+            <code>AppKey</code> 和 <code>SecretKey</code>。
+          </p>
+          <div class="auth-actions">
+            <a id="auth-button" class="button accent" href="/auth/login">前往百度授权</a>
+            <button id="refresh-token-button" class="button ghost" type="button">刷新 Token</button>
+          </div>
+          <form id="manual-auth-form" class="stack-form tight" hidden>
+            <label>
+              <span>手动粘贴授权码</span>
+              <input id="manual-auth-code" placeholder="redirect_uri=oob 时，把返回的 code 粘贴到这里" />
+            </label>
+            <button class="button ghost" type="submit">提交 code 换 token</button>
+          </form>
+        </div>
+      </details>
+
+      <details class="tree-section" open>
+        <summary>
+          <span class="tree-index">02</span>
+          <div>
+            <strong>连接状态</strong>
+            <span>授权与应用目录实时状态</span>
+          </div>
+        </summary>
+        <div class="tree-body">
+          <div class="status-list">
+            <div class="status-item">
+              <span>配置完整</span>
+              <strong id="ready-for-api">否</strong>
+            </div>
+            <div class="status-item">
+              <span>已授权</span>
+              <strong id="authorized-status">否</strong>
+            </div>
+            <div class="status-item">
+              <span>应用根目录</span>
+              <strong id="app-root-label">未配置</strong>
+            </div>
+          </div>
+          <button id="logout-button" class="button ghost danger" type="button">清除本地授权</button>
+        </div>
+      </details>
+
+      <details class="tree-section" open>
+        <summary>
+          <span class="tree-index">03</span>
+          <div>
+            <strong>自定义设置</strong>
+            <span>会员能力、分片和并发控制</span>
+          </div>
+        </summary>
+        <div class="tree-body">
+          <div class="custom-settings-card">
+            <label>
+              <span>会员等级</span>
+              <select id="membership-tier" name="membership_tier" form="settings-form">
+                <option value="free">无会员</option>
+                <option value="vip">会员 VIP</option>
+                <option value="svip">超级会员 SVIP</option>
+              </select>
+            </label>
+            <label>
+              <span>上传分片大小 MB</span>
+              <input id="upload-chunk-mb" name="upload_chunk_mb" type="number" min="1" step="1" form="settings-form" />
+            </label>
+            <label>
+              <span>CLI 下载并发</span>
+              <input id="cli-download-workers" name="cli_download_workers" type="number" min="1" step="1" form="settings-form" />
+            </label>
+            <label>
+              <span>Web 下载并发</span>
+              <input id="web-download-workers" name="web_download_workers" type="number" min="1" step="1" form="settings-form" />
+            </label>
+            <p id="custom-settings-hint" class="panel-note">默认按无会员能力运行。</p>
+          </div>
+        </div>
+      </details>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="download-target-dialog" class="dialog-shell upload-target-dialog">
+  <div class="dialog-form upload-target-dialog-form">
+    <div class="panel-head">
+      <div>
+        <p class="eyebrow">Download Target</p>
+        <h2>选择下载目录</h2>
+      </div>
+      <div class="auth-actions">
+        <button class="button ghost" value="cancel" type="button" data-close-dialog="download-target-dialog">关闭</button>
+      </div>
+    </div>
+    <section class="browser-like-panel">
+      <div class="browser-head compact-browser-head">
+        <div>
+          <p class="eyebrow">Download</p>
+          <h2>目录选择</h2>
+        </div>
+        <div class="browser-actions">
+          <button id="download-target-use-current-button" class="button ghost" type="button">当前目录</button>
+          <button id="download-target-confirm-button" class="button accent" type="button">确定</button>
+        </div>
+      </div>
+      <div class="browser-toolbar">
+        <div class="notice upload-browser-notice">
+          <span>已选:</span>
+          <strong id="download-target-selection-text">未选择</strong>
+        </div>
+      </div>
+      <div id="download-target-breadcrumbs" class="breadcrumbs upload-target-breadcrumbs"></div>
+      <div class="table-wrap browser-picker-table">
+        <table class="file-table">
+          <thead>
+            <tr>
+              <th>名称</th>
+              <th>类型</th>
+              <th class="fit">操作</th>
+            </tr>
+          </thead>
+          <tbody id="download-target-list">
+            <tr>
+              <td colspan="3" class="empty-state">加载中…</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+</dialog>
+
+<dialog id="rename-dialog" class="dialog-shell">
+  <form id="rename-form" method="dialog" class="dialog-form">
+    <h3>重命名</h3>
+    <input id="rename-path" type="hidden" />
+    <label>
+      <span>新名字</span>
+      <input id="rename-name" required />
+    </label>
+    <menu>
+      <button class="button ghost" value="cancel" type="button" data-close-dialog="rename-dialog">取消</button>
+      <button class="button primary" type="submit">确认</button>
+    </menu>
+  </form>
+</dialog>
+
+<dialog id="move-dialog" class="dialog-shell">
+  <form id="move-form" method="dialog" class="dialog-form">
+    <h3>移动文件</h3>
+    <input id="move-path" type="hidden" />
+    <label>
+      <span>目标目录</span>
+      <input id="move-destination" required />
+    </label>
+    <label>
+      <span>可选新名字</span>
+      <input id="move-new-name" />
+    </label>
+    <menu>
+      <button class="button ghost" value="cancel" type="button" data-close-dialog="move-dialog">取消</button>
+      <button class="button primary" type="submit">确认</button>
+    </menu>
+  </form>
+</dialog>
+{% endblock %}

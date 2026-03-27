@@ -1,0 +1,13 @@
+{
+  "apps": [
+    {
+      "id": "bypy",
+      "label": "bypy",
+      "app_key": "q8WE4EpCsau1oS0MplgMKNBn",
+      "secret_key": "PA4MhwB5RE7DacKtoP2i8ikCnNzAqYTD",
+      "app_name": "bypy",
+      "app_root": "/apps/bypy",
+      "source": "builtin"
+    }
+  ]
+}

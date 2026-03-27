@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="callback-shell">
+  <div class="panel callback-card">
+    <p class="eyebrow">OAuth Callback</p>
+    <h1>{{ "授权成功" if success else "授权失败" }}</h1>
+    <p>{{ message }}</p>
+    <a class="button primary" href="/">返回控制台</a>
+  </div>
+</section>
+{% endblock %}

@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Baidu Pan Dock</title>
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <div class="backdrop"></div>
+    <div class="grid-mask"></div>
+    <main class="shell">
+      {% block content %}{% endblock %}
+    </main>
+    <div id="toast" class="toast" hidden></div>
+    {% if bootstrap is defined %}
+    <script>
+      window.APP_BOOTSTRAP = {{ bootstrap | tojson }};
+    </script>
+    {% endif %}
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>
