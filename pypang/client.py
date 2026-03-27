@@ -52,6 +52,27 @@ class DownloadSpec:
 
 
 DownloadProgressCallback = Callable[[dict[str, Any]], None]
+UploadProgressCallback = Callable[[dict[str, Any]], None]
+
+
+class _ProgressReader:
+    def __init__(
+        self,
+        raw,
+        *,
+        callback: Callable[[int], None] | None = None,
+    ):
+        self._raw = raw
+        self._callback = callback
+
+    def read(self, size: int = -1):
+        chunk = self._raw.read(size)
+        if chunk and self._callback:
+            self._callback(len(chunk))
+        return chunk
+
+    def __getattr__(self, name: str):
+        return getattr(self._raw, name)
 
 
 class BaiduPanClient:
@@ -369,17 +390,37 @@ class BaiduPanClient:
         *,
         policy: str = "overwrite",
         prefer_single_step: bool = False,
+        progress_callback: UploadProgressCallback | None = None,
     ) -> dict[str, Any]:
         source = Path(local_path)
         if not source.is_file():
             raise ConfigurationError(f"Local file does not exist: {source}")
 
         remote_target = self.resolve_upload_target(source.name, remote_path)
+        total_size = int(source.stat().st_size)
+        uploaded_bytes = 0
         chunk_size = self.upload_chunk_size()
         if prefer_single_step and source.stat().st_size <= chunk_size:
-            return self.upload_file_single_step(source, remote_target, ondup=policy)
+            result = self.upload_file_single_step(
+                source,
+                remote_target,
+                ondup=policy,
+                progress_callback=progress_callback,
+            )
+            self._report_upload_progress(
+                progress_callback,
+                phase="completed",
+                label=remote_target,
+                transferred_bytes=total_size,
+                total_bytes=total_size,
+            )
+            return result
 
-        digest_plan = self._build_upload_digests(source)
+        digest_plan = self._build_upload_digests(
+            source,
+            progress_callback=progress_callback,
+            label=remote_target,
+        )
         precreate = self._request_json(
             "POST",
             f"{PAN_BASE_URL}/rest/2.0/xpan/file",
@@ -409,6 +450,15 @@ class BaiduPanClient:
 
         upload_server = self.locate_upload_server(remote_target, upload_id)
         missing_parts = self._normalize_missing_parts(precreate.get("block_list"))
+        if not missing_parts:
+            uploaded_bytes = total_size
+        self._report_upload_progress(
+            progress_callback,
+            phase="uploading",
+            label=remote_target,
+            transferred_bytes=uploaded_bytes,
+            total_bytes=total_size,
+        )
         for index in missing_parts:
             self._upload_part(
                 server_url=upload_server,
@@ -416,9 +466,15 @@ class BaiduPanClient:
                 upload_id=upload_id,
                 part_index=index,
                 file_path=source,
+                progress_callback=progress_callback,
+                total_bytes=total_size,
+                transferred_bytes=uploaded_bytes,
+                label=remote_target,
             )
+            part_size = min(chunk_size, max(0, total_size - (index * chunk_size)))
+            uploaded_bytes += part_size
 
-        return self._request_json(
+        result = self._request_json(
             "POST",
             f"{PAN_BASE_URL}/rest/2.0/xpan/file",
             params={
@@ -438,6 +494,14 @@ class BaiduPanClient:
                 "local_mtime": digest_plan.local_mtime,
             },
         )
+        self._report_upload_progress(
+            progress_callback,
+            phase="completed",
+            label=remote_target,
+            transferred_bytes=total_size,
+            total_bytes=total_size,
+        )
+        return result
 
     def upload_file_single_step(
         self,
@@ -445,11 +509,35 @@ class BaiduPanClient:
         remote_path: str,
         *,
         ondup: str = "overwrite",
+        progress_callback: UploadProgressCallback | None = None,
     ) -> dict[str, Any]:
         source = Path(local_path)
         remote_target = self.normalize_remote_path(remote_path)
         upload_server = "https://c3.pcs.baidu.com"
+        total_size = int(source.stat().st_size)
+        self._report_upload_progress(
+            progress_callback,
+            phase="uploading",
+            label=remote_target,
+            transferred_bytes=0,
+            total_bytes=total_size,
+        )
         with source.open("rb") as handle:
+            state = {"sent": 0}
+            wrapped = _ProgressReader(
+                handle,
+                callback=lambda size: (
+                    state.__setitem__("sent", state["sent"] + size),
+                    self._report_upload_progress(
+                        progress_callback,
+                        phase="uploading",
+                        label=remote_target,
+                        transferred_bytes=state["sent"],
+                        total_bytes=total_size,
+                        delta_bytes=size,
+                    ),
+                )[-1],
+            )
             return self._request_json(
                 "POST",
                 f"{upload_server}/rest/2.0/pcs/file",
@@ -459,7 +547,7 @@ class BaiduPanClient:
                     "path": remote_target,
                     "ondup": self._ondup_from_policy(ondup),
                 },
-                files={"file": (source.name, handle)},
+                files={"file": (source.name, wrapped)},
             )
 
     def locate_upload_server(self, remote_path: str, upload_id: str) -> str:
@@ -580,6 +668,29 @@ class BaiduPanClient:
                     "download_delta_bytes": int(download_delta_bytes),
                     "verify_bytes": int(verify_bytes),
                     "verify_total_bytes": int(verify_total_bytes),
+                }
+            )
+
+    def _report_upload_progress(
+        self,
+        callback: UploadProgressCallback | None,
+        *,
+        phase: str,
+        label: str,
+        transferred_bytes: int = 0,
+        total_bytes: int = 0,
+        delta_bytes: int = 0,
+        incremental: bool = False,
+    ) -> None:
+        if callback:
+            callback(
+                {
+                    "phase": phase,
+                    "label": label,
+                    "transferred_bytes": int(transferred_bytes),
+                    "total_bytes": int(total_bytes),
+                    "delta_bytes": int(delta_bytes),
+                    "incremental": bool(incremental),
                 }
             )
 
@@ -1053,23 +1164,46 @@ class BaiduPanClient:
             data=payload,
         )
 
-    def _build_upload_digests(self, file_path: Path) -> UploadDigestPlan:
+    def _build_upload_digests(
+        self,
+        file_path: Path,
+        *,
+        progress_callback: UploadProgressCallback | None = None,
+        label: str | None = None,
+    ) -> UploadDigestPlan:
         stat = file_path.stat()
         file_size = stat.st_size
         content_md5 = hashlib.md5()
         block_list: list[str] = []
+        self._report_upload_progress(
+            progress_callback,
+            phase="hashing",
+            label=label or str(file_path),
+            transferred_bytes=0,
+            total_bytes=file_size,
+        )
 
         with file_path.open("rb") as handle:
             first_slice = handle.read(FIRST_SLICE_SIZE)
         first_slice_md5 = hashlib.md5(first_slice).hexdigest()
 
         with file_path.open("rb") as handle:
+            hashed_bytes = 0
             while True:
                 chunk = handle.read(self.upload_chunk_size())
                 if not chunk:
                     break
                 content_md5.update(chunk)
                 block_list.append(hashlib.md5(chunk).hexdigest())
+                hashed_bytes += len(chunk)
+                self._report_upload_progress(
+                    progress_callback,
+                    phase="hashing",
+                    label=label or str(file_path),
+                    transferred_bytes=hashed_bytes,
+                    total_bytes=file_size,
+                    delta_bytes=len(chunk),
+                )
 
         if file_size == 0:
             content_md5.update(b"")
@@ -1105,11 +1239,30 @@ class BaiduPanClient:
         upload_id: str,
         part_index: int,
         file_path: Path,
+        progress_callback: UploadProgressCallback | None = None,
+        total_bytes: int = 0,
+        transferred_bytes: int = 0,
+        label: str | None = None,
     ) -> dict[str, Any]:
         with file_path.open("rb") as handle:
             chunk_size = self.upload_chunk_size()
             handle.seek(part_index * chunk_size)
             chunk = handle.read(chunk_size)
+        state = {"sent": int(transferred_bytes)}
+        wrapped = _ProgressReader(
+            io.BytesIO(chunk),
+            callback=lambda size: (
+                state.__setitem__("sent", state["sent"] + size),
+                self._report_upload_progress(
+                    progress_callback,
+                    phase="uploading",
+                    label=label or remote_path,
+                    transferred_bytes=state["sent"],
+                    total_bytes=total_bytes,
+                    delta_bytes=size,
+                ),
+            )[-1],
+        )
 
         return self._request_json(
             "POST",
@@ -1122,7 +1275,7 @@ class BaiduPanClient:
                 "uploadid": upload_id,
                 "partseq": part_index,
             },
-            files={"file": (file_path.name, io.BytesIO(chunk))},
+            files={"file": (file_path.name, wrapped)},
         )
 
     def _rtype_from_policy(self, policy: str) -> int:

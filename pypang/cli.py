@@ -3,6 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
 
 
 from . import __version__
@@ -128,8 +132,126 @@ def _print_json(payload):
     print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
+def _format_size(num_bytes: int) -> str:
+    value = float(max(0, int(num_bytes)))
+    units = ["B", "KB", "MB", "GB", "TB"]
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)}{unit}"
+            return f"{value:.1f}{unit}"
+        value /= 1024
+    return f"{value:.1f}TB"
+
+
+def _format_mtime(timestamp: int) -> str:
+    if not timestamp:
+        return "-"
+    return datetime.fromtimestamp(int(timestamp)).strftime("%Y-%m-%d %H:%M")
+
+
+def _print_listing(client: BaiduPanClient, payload: dict) -> None:
+    items = list(payload.get("list") or [])
+    cwd = client.display_path(str(payload.get("cwd") or "/"))
+    print(f"Directory: {cwd}")
+    if not items:
+        print("(empty)")
+        return
+
+    rows: list[tuple[str, str, str, str]] = []
+    for item in items:
+        is_dir = bool(item.get("isdir"))
+        item_type = "DIR" if is_dir else "FILE"
+        size = "-" if is_dir else _format_size(int(item.get("size", 0) or 0))
+        mtime = _format_mtime(int(item.get("server_mtime", 0) or item.get("local_mtime", 0) or 0))
+        name = str(item.get("server_filename") or Path(str(item.get("path") or "")).name or "")
+        rows.append((item_type, size, mtime, name))
+
+    type_width = max(len(row[0]) for row in rows)
+    size_width = max(len(row[1]) for row in rows)
+    time_width = max(len(row[2]) for row in rows)
+    for item_type, size, mtime, name in rows:
+        print(f"{item_type:<{type_width}}  {size:>{size_width}}  {mtime:<{time_width}}  {name}")
+
+
+class _CliProgressRenderer:
+    def __init__(self, action: str):
+        self.action = action
+        self._last_render_at = 0.0
+        self._speed_window_started_at = time.time()
+        self._speed_window_bytes = 0
+        self._last_line_length = 0
+        self._current_value = 0
+
+    def update(self, event: dict) -> None:
+        phase = str(event.get("phase") or "")
+        label = str(event.get("label") or self.action)
+        total = int(
+            event.get("download_total_bytes", 0)
+            or event.get("verify_total_bytes", 0)
+            or event.get("total_bytes", 0)
+            or 0
+        )
+        if "downloaded_bytes" in event:
+            value = int(event.get("downloaded_bytes", 0) or 0)
+            delta = int(event.get("download_delta_bytes", 0) or 0)
+        elif "verify_bytes" in event and phase == "verifying":
+            value = int(event.get("verify_bytes", 0) or 0)
+            delta = 0
+        else:
+            if bool(event.get("incremental")):
+                self._current_value += int(event.get("delta_bytes", 0) or 0)
+            else:
+                self._current_value = int(event.get("transferred_bytes", 0) or 0)
+            value = self._current_value
+            delta = int(event.get("delta_bytes", 0) or 0)
+
+        now = time.time()
+        self._speed_window_bytes += max(0, delta)
+        elapsed = max(now - self._speed_window_started_at, 1e-6)
+        speed = self._speed_window_bytes / elapsed if self._speed_window_bytes > 0 else 0.0
+
+        should_render = phase == "completed" or (now - self._last_render_at) >= 0.2
+        if not should_render:
+            return
+
+        if phase == "completed":
+            line = f"{self.action}: completed  {_format_size(value)}  {label}"
+        else:
+            percent = f"{(value / total * 100):5.1f}%" if total > 0 else "  ---%"
+            speed_text = f"{_format_size(int(speed))}/s" if speed > 0 else "--"
+            phase_text = {
+                "hashing": "hashing",
+                "uploading": "uploading",
+                "downloading": "downloading",
+                "verifying": "verifying",
+            }.get(phase, phase or self.action)
+            line = f"{self.action}: {phase_text:<11} {percent}  {_format_size(value)}/{_format_size(total) if total else '?'}  {speed_text:<10}  {label}"
+
+        padding = max(0, self._last_line_length - len(line))
+        sys.stdout.write("\r" + line + (" " * padding))
+        sys.stdout.flush()
+        self._last_line_length = len(line)
+        self._last_render_at = now
+        if elapsed >= 1.0:
+            self._speed_window_started_at = now
+            self._speed_window_bytes = 0
+
+    def finish(self) -> None:
+        if self._last_line_length:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self._last_line_length = 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
+    if argv is not None and not argv:
+        parser.print_help()
+        return 0
+    if argv is None and len(sys.argv) <= 1:
+        parser.print_help()
+        return 0
     args = parser.parse_args(argv)
     store = StateStore()
     client = BaiduPanClient(store=store)
@@ -151,7 +273,7 @@ def main(argv: list[str] | None = None) -> int:
             _print_json(client.get_quota())
             return 0
         if args.command in {"list", "ls"}:
-            _print_json(client.list_files(args.path))
+            _print_listing(client, client.list_files(args.path))
             return 0
         if args.command == "mkdir":
             _print_json(
@@ -159,21 +281,26 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         if args.command in {"upload", "put"}:
-            _print_json(
-                client.upload_file(
-                    args.local_path,
-                    args.remote_path,
-                    policy=args.policy,
-                    prefer_single_step=args.single_step,
-                )
+            progress = _CliProgressRenderer("upload")
+            result = client.upload_file(
+                args.local_path,
+                args.remote_path,
+                policy=args.policy,
+                prefer_single_step=args.single_step,
+                progress_callback=progress.update,
             )
+            progress.finish()
+            print(f"Uploaded: {args.local_path} -> {client.display_path(str(result.get('path') or args.remote_path or ''))}")
             return 0
         if args.command in {"download", "get"}:
+            progress = _CliProgressRenderer("download")
             target = client.download_file(
                 args.remote_path,
                 args.destination,
                 resume=not args.no_resume,
+                progress_callback=progress.update,
             )
+            progress.finish()
             print(target)
             return 0
         if args.command == "rename":
