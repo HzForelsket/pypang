@@ -196,38 +196,69 @@ class _CliProgressRenderer:
     def __init__(self, action: str):
         self.action = action
         self._last_render_at = 0.0
-        self._speed_window_started_at = time.time()
-        self._speed_window_bytes = 0
         self._last_line_length = 0
         self._current_value = 0
+        self._last_foreground_event: dict | None = None
+        self._prepare_event: dict | None = None
+        self._last_speed_phase = ""
+        self._last_speed_volume_index = 0
+        self._last_speed_sample_at = time.time()
+        self._instant_speed_bps = 0.0
 
     def update(self, event: dict) -> None:
-        phase = str(event.get("phase") or "")
-        label = str(event.get("label") or self.action)
+        stream = str(event.get("stream") or "foreground")
+        if stream == "prepare":
+            self._prepare_event = dict(event)
+        else:
+            self._last_foreground_event = dict(event)
+            foreground_volume_index = int(event.get("volume_index", 0) or 0)
+            prepare_volume_index = int((self._prepare_event or {}).get("volume_index", 0) or 0)
+            if prepare_volume_index and prepare_volume_index <= foreground_volume_index:
+                self._prepare_event = None
+
+        display_event = self._last_foreground_event or dict(event)
+        phase = str(display_event.get("phase") or "")
+        label = str(display_event.get("label") or self.action)
+        volume_index = int(display_event.get("volume_index", 0) or 0)
+        volume_count = int(display_event.get("volume_count", 0) or 0)
         total = int(
-            event.get("download_total_bytes", 0)
-            or event.get("verify_total_bytes", 0)
-            or event.get("total_bytes", 0)
+            display_event.get("download_total_bytes", 0)
+            or display_event.get("verify_total_bytes", 0)
+            or display_event.get("total_bytes", 0)
             or 0
         )
-        if "downloaded_bytes" in event:
-            value = int(event.get("downloaded_bytes", 0) or 0)
-            delta = int(event.get("download_delta_bytes", 0) or 0)
-        elif "verify_bytes" in event and phase == "verifying":
-            value = int(event.get("verify_bytes", 0) or 0)
+        if "downloaded_bytes" in display_event:
+            value = int(display_event.get("downloaded_bytes", 0) or 0)
+            delta = int(display_event.get("download_delta_bytes", 0) or 0)
+        elif "verify_bytes" in display_event and phase == "verifying":
+            value = int(display_event.get("verify_bytes", 0) or 0)
             delta = 0
         else:
-            if bool(event.get("incremental")):
-                self._current_value += int(event.get("delta_bytes", 0) or 0)
+            if stream != "prepare" and bool(display_event.get("incremental")):
+                self._current_value += int(display_event.get("delta_bytes", 0) or 0)
+            elif stream != "prepare":
+                self._current_value = int(display_event.get("transferred_bytes", 0) or 0)
             else:
-                self._current_value = int(event.get("transferred_bytes", 0) or 0)
+                self._current_value = int(display_event.get("transferred_bytes", 0) or 0)
             value = self._current_value
-            delta = int(event.get("delta_bytes", 0) or 0)
+            delta = int(display_event.get("delta_bytes", 0) or 0)
 
         now = time.time()
-        self._speed_window_bytes += max(0, delta)
-        elapsed = max(now - self._speed_window_started_at, 1e-6)
-        speed = self._speed_window_bytes / elapsed if self._speed_window_bytes > 0 else 0.0
+        if stream != "prepare":
+            if phase != self._last_speed_phase or volume_index != self._last_speed_volume_index:
+                self._last_speed_phase = phase
+                self._last_speed_volume_index = volume_index
+                self._last_speed_sample_at = now
+                self._instant_speed_bps = 0.0
+            elif delta > 0:
+                elapsed = max(now - self._last_speed_sample_at, 1e-6)
+                sample_speed = delta / elapsed
+                if self._instant_speed_bps <= 0:
+                    self._instant_speed_bps = sample_speed
+                else:
+                    self._instant_speed_bps = (self._instant_speed_bps * 0.65) + (sample_speed * 0.35)
+                self._last_speed_sample_at = now
+        speed = self._instant_speed_bps
 
         should_render = phase == "completed" or (now - self._last_render_at) >= 0.2
         if not should_render:
@@ -244,16 +275,27 @@ class _CliProgressRenderer:
                 "downloading": "downloading",
                 "verifying": "verifying",
             }.get(phase, phase or self.action)
-            line = f"{self.action}: {phase_text:<11} {percent}  {_format_size(value)}/{_format_size(total) if total else '?'}  {speed_text:<10}  {label}"
+            if volume_count > 1 and volume_index > 0:
+                phase_text = f"{phase_text} volume {volume_index}/{volume_count}"
+            line = f"{self.action}: {phase_text:<22} {percent}  {_format_size(value)}/{_format_size(total) if total else '?'}  {speed_text:<10}  {label}"
+            if self._prepare_event:
+                prepare_index = int(self._prepare_event.get("volume_index", 0) or 0)
+                prepare_count = int(self._prepare_event.get("volume_count", 0) or 0)
+                prepare_total = int(self._prepare_event.get("total_bytes", 0) or 0)
+                prepare_value = int(self._prepare_event.get("transferred_bytes", 0) or 0)
+                if prepare_index > volume_index:
+                    prepare_percent = (
+                        f"{(prepare_value / prepare_total * 100):4.0f}%"
+                        if prepare_total > 0
+                        else "--%"
+                    )
+                    line += f" | preparing volume {prepare_index}/{prepare_count} {prepare_percent}"
 
         padding = max(0, self._last_line_length - len(line))
         sys.stdout.write("\r" + line + (" " * padding))
         sys.stdout.flush()
         self._last_line_length = len(line)
         self._last_render_at = now
-        if elapsed >= 1.0:
-            self._speed_window_started_at = now
-            self._speed_window_bytes = 0
 
     def finish(self) -> None:
         if self._last_line_length:

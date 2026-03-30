@@ -479,23 +479,31 @@ class BaiduPanClient:
             for index in range(volume_count)
         ]
         uploaded_volumes: list[dict[str, Any]] = []
+        first_spec = self._prepare_upload_volume(
+            source,
+            volume_specs[0],
+            prefer_single_step=prefer_single_step,
+            progress_callback=progress_callback,
+            volume_count=volume_count,
+            report_as_prepare=False,
+        )
         with ThreadPoolExecutor(max_workers=1) as executor:
-            next_future = executor.submit(
-                self._prepare_upload_volume,
-                source,
-                volume_specs[0],
-                prefer_single_step=prefer_single_step,
-            )
             for index, spec in enumerate(volume_specs):
-                prepared_spec = next_future.result()
-                if prepared_spec.index != spec.index:
-                    raise ConfigurationError("Upload pipeline returned an unexpected volume order.")
+                if index == 0:
+                    prepared_spec = first_spec
+                else:
+                    prepared_spec = next_future.result()
+                    if prepared_spec.index != spec.index:
+                        raise ConfigurationError("Upload pipeline returned an unexpected volume order.")
                 if index + 1 < len(volume_specs):
                     next_future = executor.submit(
                         self._prepare_upload_volume,
                         source,
                         volume_specs[index + 1],
                         prefer_single_step=prefer_single_step,
+                        progress_callback=progress_callback,
+                        volume_count=volume_count,
+                        report_as_prepare=True,
                     )
                 result = self._upload_single_file(
                     source,
@@ -505,6 +513,8 @@ class BaiduPanClient:
                     progress_callback=progress_callback,
                     byte_range=(prepared_spec.start, prepared_spec.size),
                     digest_plan=prepared_spec.digest_plan,
+                    volume_index=prepared_spec.index + 1,
+                    volume_count=volume_count,
                 )
                 uploaded_volumes.append(
                     {
@@ -541,6 +551,8 @@ class BaiduPanClient:
         progress_callback: UploadProgressCallback | None = None,
         byte_range: tuple[int, int] | None = None,
         digest_plan: UploadDigestPlan | None = None,
+        volume_index: int = 0,
+        volume_count: int = 0,
     ) -> dict[str, Any]:
         range_start, range_size = self._normalize_byte_range(source, byte_range)
         uploaded_bytes = 0
@@ -559,6 +571,8 @@ class BaiduPanClient:
                 label=remote_target,
                 transferred_bytes=range_size,
                 total_bytes=range_size,
+                volume_index=volume_index,
+                volume_count=volume_count,
             )
             return result
 
@@ -606,6 +620,8 @@ class BaiduPanClient:
             label=remote_target,
             transferred_bytes=uploaded_bytes,
             total_bytes=range_size,
+            volume_index=volume_index,
+            volume_count=volume_count,
         )
         for index in missing_parts:
             self._upload_part(
@@ -649,6 +665,8 @@ class BaiduPanClient:
             label=remote_target,
             transferred_bytes=range_size,
             total_bytes=range_size,
+            volume_index=volume_index,
+            volume_count=volume_count,
         )
         return result
 
@@ -658,13 +676,35 @@ class BaiduPanClient:
         spec: UploadVolumeSpec,
         *,
         prefer_single_step: bool,
+        progress_callback: UploadProgressCallback | None = None,
+        volume_count: int = 0,
+        report_as_prepare: bool = False,
     ) -> UploadVolumeSpec:
         chunk_size = self.upload_chunk_size()
         if prefer_single_step and spec.size <= min(chunk_size, 2_000_000_000):
             return spec
+        callback = progress_callback
+        if progress_callback and report_as_prepare:
+            callback = lambda event: progress_callback(
+                {
+                    **event,
+                    "phase": "preparing",
+                    "stream": "prepare",
+                    "volume_index": int(spec.index + 1),
+                    "volume_count": int(volume_count),
+                }
+            )
+        elif progress_callback:
+            callback = lambda event: progress_callback(
+                {
+                    **event,
+                    "volume_index": int(spec.index + 1),
+                    "volume_count": int(volume_count),
+                }
+            )
         spec.digest_plan = self._build_upload_digests(
             source,
-            progress_callback=None,
+            progress_callback=callback,
             label=spec.target,
             byte_range=(spec.start, spec.size),
         )
@@ -874,6 +914,8 @@ class BaiduPanClient:
         total_bytes: int = 0,
         delta_bytes: int = 0,
         incremental: bool = False,
+        volume_index: int = 0,
+        volume_count: int = 0,
     ) -> None:
         if callback:
             callback(
@@ -884,6 +926,8 @@ class BaiduPanClient:
                     "total_bytes": int(total_bytes),
                     "delta_bytes": int(delta_bytes),
                     "incremental": bool(incremental),
+                    "volume_index": int(volume_index),
+                    "volume_count": int(volume_count),
                 }
             )
 
