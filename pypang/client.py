@@ -39,6 +39,8 @@ DEFAULT_API_TIMEOUT = 120
 DEFAULT_UPLOAD_TIMEOUT = 180
 DEFAULT_UPLOAD_RETRIES = 3
 DEFAULT_UPLOAD_RETRY_BACKOFF = 2.0
+DEFAULT_UPLOAD_COOLDOWN_BYTES = 40 * 1024 * 1024 * 1024
+DEFAULT_UPLOAD_COOLDOWN_SECONDS = 10
 logger = logging.getLogger(__name__)
 MD5_RE = re.compile(r"^[0-9a-f]{32}$")
 
@@ -609,6 +611,8 @@ class BaiduPanClient:
         next_prepare_future = None
         pending_uploads: dict[Any, UploadVolumeSpec] = {}
         prepared_specs: deque[UploadVolumeSpec] = deque()
+        bytes_since_cooldown = 0
+        cooldown_pending = False
 
         def _submit_upload(prepared_spec: UploadVolumeSpec, upload_executor: ThreadPoolExecutor) -> None:
             future = upload_executor.submit(
@@ -658,7 +662,7 @@ class BaiduPanClient:
                     else:
                         next_prepare_future = None
 
-                while prepared_specs and len(pending_uploads) < volume_workers:
+                while prepared_specs and len(pending_uploads) < volume_workers and not cooldown_pending:
                     _submit_upload(prepared_specs.popleft(), upload_executor)
 
                 if pending_uploads:
@@ -675,6 +679,9 @@ class BaiduPanClient:
                                 "result": result,
                             }
                         )
+                        bytes_since_cooldown += prepared_spec.size
+                        if bytes_since_cooldown >= DEFAULT_UPLOAD_COOLDOWN_BYTES:
+                            cooldown_pending = True
                 elif next_prepare_future is not None:
                     prepared_specs.append(next_prepare_future.result())
                     if next_spec_index < len(remaining_specs):
@@ -690,6 +697,16 @@ class BaiduPanClient:
                         next_spec_index += 1
                     else:
                         next_prepare_future = None
+
+                if cooldown_pending and not pending_uploads:
+                    logger.info(
+                        "Pause multi-volume upload for %s seconds after transferring %s bytes",
+                        DEFAULT_UPLOAD_COOLDOWN_SECONDS,
+                        bytes_since_cooldown,
+                    )
+                    time.sleep(DEFAULT_UPLOAD_COOLDOWN_SECONDS)
+                    cooldown_pending = False
+                    bytes_since_cooldown = 0
 
         script_result = self.upload_text_file(
             self._build_extract_script(Path(remote_target).name, volume_specs),
