@@ -41,6 +41,8 @@ DEFAULT_UPLOAD_RETRIES = 3
 DEFAULT_UPLOAD_RETRY_BACKOFF = 2.0
 DEFAULT_UPLOAD_COOLDOWN_BYTES = 40 * 1024 * 1024 * 1024
 DEFAULT_UPLOAD_COOLDOWN_SECONDS = 10
+DEFAULT_UPLOAD_LOW_SPEED_THRESHOLD_BPS = 25 * 1024 * 1024
+DEFAULT_UPLOAD_LOW_SPEED_WINDOW_SECONDS = 12
 logger = logging.getLogger(__name__)
 MD5_RE = re.compile(r"^[0-9a-f]{32}$")
 
@@ -83,6 +85,9 @@ class _MultiVolumeUploadProgress:
         self._lock = threading.Lock()
         self._volume_progress: dict[int, int] = {}
         self._completed_volumes: set[int] = set()
+        self._speed_samples: deque[tuple[float, int]] = deque()
+        self._window_speed_bps = 0.0
+        self._active_uploads = 0
 
     def callback_for(self, volume_index: int) -> UploadProgressCallback | None:
         if self._callback is None:
@@ -103,6 +108,19 @@ class _MultiVolumeUploadProgress:
                     for index, value in self._volume_progress.items()
                     if index not in self._completed_volumes and value > 0
                 )
+                now = time.time()
+                if delta > 0:
+                    self._speed_samples.append((now, delta))
+                cutoff = now - 6.0
+                while self._speed_samples and self._speed_samples[0][0] < cutoff:
+                    self._speed_samples.popleft()
+                if self._speed_samples:
+                    total_delta = sum(sample_delta for _, sample_delta in self._speed_samples)
+                    window_span = max(now - self._speed_samples[0][0], 1e-6)
+                    self._window_speed_bps = total_delta / window_span
+                else:
+                    self._window_speed_bps = 0.0
+                self._active_uploads = int(max(1, active_uploads) if aggregate_transferred > 0 else active_uploads)
             self._callback(
                 {
                     "phase": "completed"
@@ -112,13 +130,21 @@ class _MultiVolumeUploadProgress:
                     "transferred_bytes": aggregate_transferred,
                     "total_bytes": self._total_bytes,
                     "delta_bytes": delta,
-                    "active_uploads": int(max(1, active_uploads) if aggregate_transferred > 0 else active_uploads),
+                    "active_uploads": self._active_uploads,
                     "completed_volumes": int(len(self._completed_volumes)),
                     "volume_count": self._volume_count,
                 }
             )
 
         return _callback
+
+    def current_speed_bps(self) -> float:
+        with self._lock:
+            return float(self._window_speed_bps)
+
+    def active_uploads(self) -> int:
+        with self._lock:
+            return int(self._active_uploads)
 
 
 DownloadProgressCallback = Callable[[dict[str, Any]], None]
@@ -615,6 +641,7 @@ class BaiduPanClient:
         prepared_specs: deque[UploadVolumeSpec] = deque()
         bytes_since_cooldown = 0
         cooldown_pending = False
+        low_speed_since: float | None = None
 
         def _submit_upload(prepared_spec: UploadVolumeSpec, upload_executor: ThreadPoolExecutor) -> None:
             future = upload_executor.submit(
@@ -684,6 +711,25 @@ class BaiduPanClient:
                         bytes_since_cooldown += prepared_spec.size
                         if bytes_since_cooldown >= DEFAULT_UPLOAD_COOLDOWN_BYTES:
                             cooldown_pending = True
+                    if (
+                        pending_uploads
+                        and not cooldown_pending
+                        and progress.active_uploads() > 0
+                    ):
+                        current_speed = progress.current_speed_bps()
+                        if 0 < current_speed < DEFAULT_UPLOAD_LOW_SPEED_THRESHOLD_BPS:
+                            if low_speed_since is None:
+                                low_speed_since = time.time()
+                            elif (time.time() - low_speed_since) >= DEFAULT_UPLOAD_LOW_SPEED_WINDOW_SECONDS:
+                                cooldown_pending = True
+                                logger.info(
+                                    "Pause multi-volume upload for %s seconds after sustained low speed %.1fMB/s with %s active uploads",
+                                    DEFAULT_UPLOAD_COOLDOWN_SECONDS,
+                                    current_speed / (1024 * 1024),
+                                    progress.active_uploads(),
+                                )
+                        else:
+                            low_speed_since = None
                 elif next_prepare_future is not None:
                     prepared_specs.append(next_prepare_future.result())
                     if next_spec_index < len(remaining_specs):
@@ -709,6 +755,7 @@ class BaiduPanClient:
                     time.sleep(DEFAULT_UPLOAD_COOLDOWN_SECONDS)
                     cooldown_pending = False
                     bytes_since_cooldown = 0
+                    low_speed_since = None
 
         script_result = self.upload_text_file(
             self._build_extract_script(Path(remote_target).name, volume_specs),
@@ -819,6 +866,11 @@ class BaiduPanClient:
 
             upload_servers = self._balanced_upload_servers(
                 self.locate_upload_servers(remote_target, upload_id, session=upload_session)
+            )
+            logger.info(
+                "Upload session for %s will try servers in order: %s",
+                remote_target,
+                ", ".join(upload_servers),
             )
             missing_parts = self._normalize_missing_parts(precreate.get("block_list"))
             if not missing_parts:
@@ -1988,6 +2040,12 @@ class BaiduPanClient:
 
         for server_index, server_url in enumerate(server_urls):
             try:
+                logger.info(
+                    "Upload part %s for %s via %s",
+                    part_index,
+                    remote_path,
+                    server_url,
+                )
                 with file_path.open("rb") as handle:
                     reader = _RangeReader(
                         handle,

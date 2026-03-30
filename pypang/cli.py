@@ -170,6 +170,15 @@ def _format_mtime(timestamp: int) -> str:
     return datetime.fromtimestamp(int(timestamp)).strftime("%Y-%m-%d %H:%M")
 
 
+def _format_duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
 def _print_listing(client: BaiduPanClient, payload: dict) -> None:
     items = list(payload.get("list") or [])
     cwd = client.display_path(str(payload.get("cwd") or "/"))
@@ -206,6 +215,7 @@ class _CliProgressRenderer:
         self._last_speed_volume_index = 0
         self._speed_samples: deque[tuple[float, int]] = deque()
         self._window_speed_bps = 0.0
+        self._started_at: float | None = None
 
     def update(self, event: dict) -> None:
         stream = str(event.get("stream") or "foreground")
@@ -248,13 +258,15 @@ class _CliProgressRenderer:
             delta = int(display_event.get("delta_bytes", 0) or 0)
 
         now = time.time()
+        if stream != "prepare" and self._started_at is None:
+            self._started_at = now
         if stream != "prepare":
             if phase != self._last_speed_phase or volume_index != self._last_speed_volume_index:
                 self._last_speed_phase = phase
                 self._last_speed_volume_index = volume_index
                 self._speed_samples.clear()
                 self._window_speed_bps = 0.0
-            elif phase in {"hashing", "uploading"}:
+            elif phase in {"hashing", "uploading", "downloading"}:
                 if delta > 0:
                     self._speed_samples.append((now, delta))
                 cutoff = now - 6.0
@@ -274,10 +286,15 @@ class _CliProgressRenderer:
             return
 
         if phase == "completed":
-            line = f"{self.action}: completed  {_format_size(value)}  {label}"
+            elapsed_text = _format_duration((now - self._started_at) if self._started_at else 0.0)
+            line = f"{self.action}: completed  {_format_size(value)}  elapsed {elapsed_text}  {label}"
         else:
             percent = f"{(value / total * 100):5.1f}%" if total > 0 else "  ---%"
             speed_text = f"{_format_size(int(speed))}/s" if speed > 0 else "--"
+            elapsed_text = _format_duration((now - self._started_at) if self._started_at else 0.0)
+            eta_text = "--"
+            if total > 0 and speed > 0 and value < total:
+                eta_text = _format_duration((total - value) / speed)
             phase_text = {
                 "hashing": "hashing",
                 "uploading": "uploading",
@@ -288,7 +305,11 @@ class _CliProgressRenderer:
                 phase_text = f"uploading {active_uploads}x"
             elif volume_count > 1 and volume_index > 0:
                 phase_text = f"{phase_text} volume {volume_index}/{volume_count}"
-            line = f"{self.action}: {phase_text:<22} {percent}  {_format_size(value)}/{_format_size(total) if total else '?'}  {speed_text:<10}  {label}"
+            line = (
+                f"{self.action}: {phase_text:<22} {percent}  "
+                f"{_format_size(value)}/{_format_size(total) if total else '?'}  "
+                f"{speed_text:<10}  elapsed {elapsed_text}  eta {eta_text}  {label}"
+            )
             if volume_count > 1 and completed_volumes > 0:
                 line += f" | done {completed_volumes}/{volume_count}"
             if self._prepare_event:
