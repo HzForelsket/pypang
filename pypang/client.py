@@ -178,6 +178,8 @@ class BaiduPanClient:
         self.store = store or StateStore()
         self.session = session or requests.Session()
         self._cached_profile: dict[str, Any] | None = None
+        self._upload_server_cursor = 0
+        self._upload_server_cursor_lock = threading.Lock()
 
     @property
     def state(self):
@@ -815,7 +817,9 @@ class BaiduPanClient:
             if not upload_id:
                 raise ApiError("precreate did not return uploadid", payload=precreate)
 
-            upload_server = self.locate_upload_server(remote_target, upload_id, session=upload_session)
+            upload_servers = self._balanced_upload_servers(
+                self.locate_upload_servers(remote_target, upload_id, session=upload_session)
+            )
             missing_parts = self._normalize_missing_parts(precreate.get("block_list"))
             if not missing_parts:
                 uploaded_bytes = range_size
@@ -830,7 +834,7 @@ class BaiduPanClient:
             )
             for index in missing_parts:
                 self._upload_part(
-                    server_url=upload_server,
+                    server_urls=upload_servers,
                     remote_path=remote_target,
                     upload_id=upload_id,
                     part_index=index,
@@ -993,13 +997,13 @@ class BaiduPanClient:
             files={"file": (Path(remote_target).name, io.BytesIO(payload))},
         )
 
-    def locate_upload_server(
+    def locate_upload_servers(
         self,
         remote_path: str,
         upload_id: str,
         *,
         session: requests.Session | None = None,
-    ) -> str:
+    ) -> list[str]:
         remote_target = self.normalize_remote_path(remote_path)
         payload = self._request_json(
             "GET",
@@ -1015,17 +1019,52 @@ class BaiduPanClient:
             session=session,
         )
 
-        servers = payload.get("servers") or []
-        if servers:
-            candidate = servers[0].get("server", "")
-            if candidate:
-                return candidate.rstrip("/")
+        candidates: list[str] = []
+        for item in payload.get("servers") or []:
+            candidate = str((item or {}).get("server", "")).strip()
+            if candidate.startswith("https://"):
+                candidates.append(candidate.rstrip("/"))
 
         host = str(payload.get("host", "")).strip()
         if host:
-            return f"https://{host}".rstrip("/")
+            candidates.append(f"https://{host}".rstrip("/"))
 
-        return PCS_BASE_URL
+        if not candidates:
+            candidates.append(PCS_BASE_URL)
+
+        unique_candidates: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            unique_candidates.append(candidate)
+
+        logger.info(
+            "Locate upload servers for %s returned %s",
+            remote_target,
+            ", ".join(unique_candidates),
+        )
+        return unique_candidates
+
+    def locate_upload_server(
+        self,
+        remote_path: str,
+        upload_id: str,
+        *,
+        session: requests.Session | None = None,
+    ) -> str:
+        return self.locate_upload_servers(remote_path, upload_id, session=session)[0]
+
+    def _balanced_upload_servers(self, servers: list[str]) -> list[str]:
+        if len(servers) <= 1:
+            return list(servers)
+        with self._upload_server_cursor_lock:
+            start = self._upload_server_cursor % len(servers)
+            self._upload_server_cursor += 1
+        ordered = servers[start:] + servers[:start]
+        logger.info("Balanced upload server order: %s", ", ".join(ordered))
+        return ordered
 
     def build_download_spec(self, fs_id: int) -> DownloadSpec:
         payload = self.get_file_metas([fs_id], include_dlink=True)
@@ -1929,7 +1968,7 @@ class BaiduPanClient:
     def _upload_part(
         self,
         *,
-        server_url: str,
+        server_urls: list[str],
         remote_path: str,
         upload_id: str,
         part_index: int,
@@ -1942,48 +1981,70 @@ class BaiduPanClient:
         session: requests.Session | None = None,
     ) -> dict[str, Any]:
         range_start, range_size = self._normalize_byte_range(file_path, byte_range)
-        with file_path.open("rb") as handle:
-            chunk_size = self.upload_chunk_size()
-            remaining = max(0, range_size - (part_index * chunk_size))
-            part_size = min(chunk_size, remaining)
-            reader = _RangeReader(
-                handle,
-                start=range_start + (part_index * chunk_size),
-                length=part_size,
-            )
-            state = {"sent": int(transferred_bytes)}
-            wrapped = _ProgressReader(
-                reader,
-                callback=lambda size: (
-                    state.__setitem__("sent", state["sent"] + size),
-                    self._report_upload_progress(
-                        progress_callback,
-                        phase="uploading",
-                        label=label or remote_path,
-                        transferred_bytes=state["sent"],
-                        total_bytes=total_bytes,
-                        delta_bytes=size,
-                    ),
-                )[-1],
-            )
+        chunk_size = self.upload_chunk_size()
+        remaining = max(0, range_size - (part_index * chunk_size))
+        part_size = min(chunk_size, remaining)
+        last_error: ApiError | None = None
 
-            return self._request_json(
-                "POST",
-                f"{server_url.rstrip('/')}/rest/2.0/pcs/superfile2",
-                params={
-                    "method": "upload",
-                    "access_token": self._access_token(),
-                    "type": "tmpfile",
-                    "path": remote_path,
-                    "uploadid": upload_id,
-                    "partseq": part_index,
-                },
-                files={"file": (file_path.name, wrapped)},
-                session=session,
-                timeout=DEFAULT_UPLOAD_TIMEOUT,
-                retries=DEFAULT_UPLOAD_RETRIES,
-                retry_backoff=DEFAULT_UPLOAD_RETRY_BACKOFF,
-            )
+        for server_index, server_url in enumerate(server_urls):
+            try:
+                with file_path.open("rb") as handle:
+                    reader = _RangeReader(
+                        handle,
+                        start=range_start + (part_index * chunk_size),
+                        length=part_size,
+                    )
+                    state = {"sent": int(transferred_bytes)}
+                    wrapped = _ProgressReader(
+                        reader,
+                        callback=lambda size: (
+                            state.__setitem__("sent", state["sent"] + size),
+                            self._report_upload_progress(
+                                progress_callback,
+                                phase="uploading",
+                                label=label or remote_path,
+                                transferred_bytes=state["sent"],
+                                total_bytes=total_bytes,
+                                delta_bytes=size,
+                            ),
+                        )[-1],
+                    )
+
+                    return self._request_json(
+                        "POST",
+                        f"{server_url.rstrip('/')}/rest/2.0/pcs/superfile2",
+                        params={
+                            "method": "upload",
+                            "access_token": self._access_token(),
+                            "type": "tmpfile",
+                            "path": remote_path,
+                            "uploadid": upload_id,
+                            "partseq": part_index,
+                        },
+                        files={"file": (file_path.name, wrapped)},
+                        session=session,
+                        timeout=DEFAULT_UPLOAD_TIMEOUT,
+                        retries=DEFAULT_UPLOAD_RETRIES,
+                        retry_backoff=DEFAULT_UPLOAD_RETRY_BACKOFF,
+                    )
+            except ApiError as exc:
+                last_error = exc
+                error_text = str(exc).lower()
+                is_connection_issue = "connection failed" in error_text or "timed out" in error_text
+                if not is_connection_issue or server_index >= len(server_urls) - 1:
+                    raise
+                logger.warning(
+                    "Retry upload part %s for %s on next upload server after %s: %s -> %s",
+                    part_index,
+                    remote_path,
+                    str(exc),
+                    server_url,
+                    server_urls[server_index + 1],
+                )
+
+        if last_error is not None:
+            raise last_error
+        raise ApiError("No upload server available for superfile2 request")
 
     def _normalize_byte_range(
         self,

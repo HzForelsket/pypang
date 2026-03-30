@@ -5,6 +5,7 @@ import json
 import logging
 import sys
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -203,8 +204,7 @@ class _CliProgressRenderer:
         self._prepare_event: dict | None = None
         self._last_speed_phase = ""
         self._last_speed_volume_index = 0
-        self._last_speed_sample_at = time.time()
-        self._last_speed_value = 0
+        self._speed_samples: deque[tuple[float, int]] = deque()
         self._window_speed_bps = 0.0
 
     def update(self, event: dict) -> None:
@@ -252,16 +252,20 @@ class _CliProgressRenderer:
             if phase != self._last_speed_phase or volume_index != self._last_speed_volume_index:
                 self._last_speed_phase = phase
                 self._last_speed_volume_index = volume_index
-                self._last_speed_sample_at = now
-                self._last_speed_value = value
+                self._speed_samples.clear()
                 self._window_speed_bps = 0.0
             elif phase in {"hashing", "uploading"}:
-                elapsed = now - self._last_speed_sample_at
-                if elapsed >= 2.0:
-                    delta_value = max(0, value - self._last_speed_value)
-                    self._window_speed_bps = delta_value / max(elapsed, 1e-6)
-                    self._last_speed_sample_at = now
-                    self._last_speed_value = value
+                if delta > 0:
+                    self._speed_samples.append((now, delta))
+                cutoff = now - 6.0
+                while self._speed_samples and self._speed_samples[0][0] < cutoff:
+                    self._speed_samples.popleft()
+                if self._speed_samples:
+                    total_delta = sum(sample_delta for _, sample_delta in self._speed_samples)
+                    window_span = max(now - self._speed_samples[0][0], 1e-6)
+                    self._window_speed_bps = total_delta / window_span
+                else:
+                    self._window_speed_bps = 0.0
         speed = self._window_speed_bps
 
         render_interval = 2.0 if phase in {"hashing", "uploading"} else 0.2
