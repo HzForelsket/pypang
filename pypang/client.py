@@ -9,6 +9,7 @@ import posixpath
 import re
 import threading
 import time
+from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
@@ -551,6 +552,7 @@ class BaiduPanClient:
         next_spec_index = 1
         next_prepare_future = None
         pending_uploads: dict[Any, UploadVolumeSpec] = {}
+        prepared_specs: deque[UploadVolumeSpec] = deque()
 
         def _submit_upload(prepared_spec: UploadVolumeSpec, upload_executor: ThreadPoolExecutor) -> None:
             future = upload_executor.submit(
@@ -583,14 +585,9 @@ class BaiduPanClient:
                 )
                 next_spec_index += 1
 
-            while pending_uploads or next_prepare_future is not None:
-                while (
-                    next_prepare_future is not None
-                    and next_prepare_future.done()
-                    and len(pending_uploads) < volume_workers
-                ):
-                    prepared_spec = next_prepare_future.result()
-                    _submit_upload(prepared_spec, upload_executor)
+            while pending_uploads or next_prepare_future is not None or prepared_specs:
+                while next_prepare_future is not None and next_prepare_future.done():
+                    prepared_specs.append(next_prepare_future.result())
                     if next_spec_index < len(volume_specs):
                         next_prepare_future = prepare_executor.submit(
                             self._prepare_upload_volume,
@@ -604,6 +601,9 @@ class BaiduPanClient:
                         next_spec_index += 1
                     else:
                         next_prepare_future = None
+
+                while prepared_specs and len(pending_uploads) < volume_workers:
+                    _submit_upload(prepared_specs.popleft(), upload_executor)
 
                 if pending_uploads:
                     done, _ = wait(list(pending_uploads.keys()), timeout=0.2, return_when=FIRST_COMPLETED)
@@ -620,8 +620,7 @@ class BaiduPanClient:
                             }
                         )
                 elif next_prepare_future is not None:
-                    prepared_spec = next_prepare_future.result()
-                    _submit_upload(prepared_spec, upload_executor)
+                    prepared_specs.append(next_prepare_future.result())
                     if next_spec_index < len(volume_specs):
                         next_prepare_future = prepare_executor.submit(
                             self._prepare_upload_volume,
