@@ -204,7 +204,8 @@ class _CliProgressRenderer:
         self._last_speed_phase = ""
         self._last_speed_volume_index = 0
         self._last_speed_sample_at = time.time()
-        self._instant_speed_bps = 0.0
+        self._last_speed_value = 0
+        self._window_speed_bps = 0.0
 
     def update(self, event: dict) -> None:
         stream = str(event.get("stream") or "foreground")
@@ -252,18 +253,19 @@ class _CliProgressRenderer:
                 self._last_speed_phase = phase
                 self._last_speed_volume_index = volume_index
                 self._last_speed_sample_at = now
-                self._instant_speed_bps = 0.0
-            elif delta > 0:
-                elapsed = max(now - self._last_speed_sample_at, 1e-6)
-                sample_speed = delta / elapsed
-                if self._instant_speed_bps <= 0:
-                    self._instant_speed_bps = sample_speed
-                else:
-                    self._instant_speed_bps = (self._instant_speed_bps * 0.65) + (sample_speed * 0.35)
-                self._last_speed_sample_at = now
-        speed = self._instant_speed_bps
+                self._last_speed_value = value
+                self._window_speed_bps = 0.0
+            elif phase in {"hashing", "uploading"}:
+                elapsed = now - self._last_speed_sample_at
+                if elapsed >= 2.0:
+                    delta_value = max(0, value - self._last_speed_value)
+                    self._window_speed_bps = delta_value / max(elapsed, 1e-6)
+                    self._last_speed_sample_at = now
+                    self._last_speed_value = value
+        speed = self._window_speed_bps
 
-        should_render = phase == "completed" or (now - self._last_render_at) >= 0.2
+        render_interval = 2.0 if phase in {"hashing", "uploading"} else 0.2
+        should_render = phase == "completed" or (now - self._last_render_at) >= render_interval
         if not should_render:
             return
 
