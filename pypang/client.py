@@ -34,9 +34,11 @@ DEFAULT_SINGLE_FILE_DOWNLOAD_WORKERS = 4
 MIN_SINGLE_FILE_PARALLEL_SIZE = 8 * 1024 * 1024
 CHECKSUM_READ_SIZE = 8 * 1024 * 1024
 DEFAULT_VOLUME_SPLIT_SIZE = 2_000_000_000
-DEFAULT_UPLOAD_VOLUME_WORKERS = 2
+DEFAULT_UPLOAD_VOLUME_WORKERS = 4
 DEFAULT_API_TIMEOUT = 120
-DEFAULT_UPLOAD_TIMEOUT = 1800
+DEFAULT_UPLOAD_TIMEOUT = 180
+DEFAULT_UPLOAD_RETRIES = 3
+DEFAULT_UPLOAD_RETRY_BACKOFF = 2.0
 logger = logging.getLogger(__name__)
 MD5_RE = re.compile(r"^[0-9a-f]{32}$")
 
@@ -67,6 +69,7 @@ class UploadVolumeSpec:
     size: int
     target: str
     digest_plan: UploadDigestPlan | None = None
+    existing_entry: dict[str, Any] | None = None
 
 
 class _MultiVolumeUploadProgress:
@@ -540,15 +543,68 @@ class BaiduPanClient:
             total_bytes=total_size,
             volume_count=volume_count,
         )
+        remaining_specs: list[UploadVolumeSpec] = []
+        for spec in volume_specs:
+            existing_entry = self._find_resumable_volume_entry(spec.target, expected_size=spec.size)
+            if existing_entry is not None:
+                spec.existing_entry = existing_entry
+                uploaded_volumes.append(
+                    {
+                        "index": spec.index + 1,
+                        "path": str(existing_entry.get("path") or spec.target),
+                        "size": spec.size,
+                        "offset": spec.start,
+                        "result": existing_entry,
+                        "resumed": True,
+                    }
+                )
+                progress_callback_for_spec = progress.callback_for(spec.index + 1)
+                if progress_callback_for_spec is not None:
+                    progress_callback_for_spec(
+                        {
+                            "phase": "completed",
+                            "label": str(existing_entry.get("path") or spec.target),
+                            "transferred_bytes": spec.size,
+                            "total_bytes": spec.size,
+                            "delta_bytes": 0,
+                            "volume_index": spec.index + 1,
+                            "volume_count": volume_count,
+                        }
+                    )
+                logger.info(
+                    "Resume multi-volume upload by reusing remote volume %s (%s bytes)",
+                    str(existing_entry.get("path") or spec.target),
+                    spec.size,
+                )
+                continue
+            remaining_specs.append(spec)
+
+        if not remaining_specs:
+            script_result = self.upload_text_file(
+                self._build_extract_script(Path(remote_target).name, volume_specs),
+                posixpath.join(volume_dir, "extract.sh"),
+                ondup="overwrite",
+            )
+            uploaded_volumes.sort(key=lambda item: int(item.get("index", 0) or 0))
+            return {
+                "path": volume_dir,
+                "is_multi_volume": True,
+                "bundle_dir": volume_dir,
+                "extract_script": script_result.get("path") or posixpath.join(volume_dir, "extract.sh"),
+                "volume_size_limit": volume_limit,
+                "volume_count": volume_count,
+                "volumes": uploaded_volumes,
+            }
+
         first_spec = self._prepare_upload_volume(
             source,
-            volume_specs[0],
+            remaining_specs[0],
             prefer_single_step=prefer_single_step,
             progress_callback=progress_callback,
             volume_count=volume_count,
             report_as_prepare=False,
         )
-        volume_workers = min(DEFAULT_UPLOAD_VOLUME_WORKERS, volume_count)
+        volume_workers = min(self.config.effective_upload_volume_workers(), volume_count)
         next_spec_index = 1
         next_prepare_future = None
         pending_uploads: dict[Any, UploadVolumeSpec] = {}
@@ -559,7 +615,7 @@ class BaiduPanClient:
                 self._upload_single_file,
                 source,
                 prepared_spec.target,
-                policy=policy,
+                policy="overwrite",
                 prefer_single_step=prefer_single_step,
                 progress_callback=progress.callback_for(prepared_spec.index + 1),
                 byte_range=(prepared_spec.start, prepared_spec.size),
@@ -573,11 +629,11 @@ class BaiduPanClient:
             max_workers=volume_workers
         ) as upload_executor:
             _submit_upload(first_spec, upload_executor)
-            if next_spec_index < len(volume_specs):
+            if next_spec_index < len(remaining_specs):
                 next_prepare_future = prepare_executor.submit(
                     self._prepare_upload_volume,
                     source,
-                    volume_specs[next_spec_index],
+                    remaining_specs[next_spec_index],
                     prefer_single_step=prefer_single_step,
                     progress_callback=progress_callback,
                     volume_count=volume_count,
@@ -588,11 +644,11 @@ class BaiduPanClient:
             while pending_uploads or next_prepare_future is not None or prepared_specs:
                 while next_prepare_future is not None and next_prepare_future.done():
                     prepared_specs.append(next_prepare_future.result())
-                    if next_spec_index < len(volume_specs):
+                    if next_spec_index < len(remaining_specs):
                         next_prepare_future = prepare_executor.submit(
                             self._prepare_upload_volume,
                             source,
-                            volume_specs[next_spec_index],
+                            remaining_specs[next_spec_index],
                             prefer_single_step=prefer_single_step,
                             progress_callback=progress_callback,
                             volume_count=volume_count,
@@ -621,11 +677,11 @@ class BaiduPanClient:
                         )
                 elif next_prepare_future is not None:
                     prepared_specs.append(next_prepare_future.result())
-                    if next_spec_index < len(volume_specs):
+                    if next_spec_index < len(remaining_specs):
                         next_prepare_future = prepare_executor.submit(
                             self._prepare_upload_volume,
                             source,
-                            volume_specs[next_spec_index],
+                            remaining_specs[next_spec_index],
                             prefer_single_step=prefer_single_step,
                             progress_callback=progress_callback,
                             volume_count=volume_count,
@@ -650,6 +706,25 @@ class BaiduPanClient:
             "volume_count": volume_count,
             "volumes": uploaded_volumes,
         }
+
+    def _find_resumable_volume_entry(
+        self,
+        remote_path: str,
+        *,
+        expected_size: int,
+    ) -> dict[str, Any] | None:
+        try:
+            entry = self.get_entry_by_path(remote_path)
+        except ApiError as exc:
+            if exc.code == -9:
+                return None
+            raise
+        if bool(entry.get("isdir")):
+            return None
+        remote_size = int(entry.get("size", 0) or 0)
+        if remote_size != int(expected_size):
+            return None
+        return entry
 
     def _upload_single_file(
         self,
@@ -875,6 +950,8 @@ class BaiduPanClient:
                 files={"file": (source.name, wrapped)},
                 session=session,
                 timeout=DEFAULT_UPLOAD_TIMEOUT,
+                retries=DEFAULT_UPLOAD_RETRIES,
+                retry_backoff=DEFAULT_UPLOAD_RETRY_BACKOFF,
             )
 
     def upload_text_file(
@@ -1661,23 +1738,56 @@ class BaiduPanClient:
         auth_request: bool = False,
         session: requests.Session | None = None,
         timeout: float | tuple[float, float] = DEFAULT_API_TIMEOUT,
+        retries: int = 0,
+        retry_backoff: float = 0.0,
     ) -> dict[str, Any]:
         headers = self._base_headers()
         if auth_request:
             headers.pop("Host", None)
         client = session or self.session
-        try:
-            response = client.request(
-                method=method,
-                url=url,
-                params=params,
-                data=data,
-                files=files,
-                headers=headers,
-                timeout=timeout,
-            )
-        except requests.RequestException as exc:
-            raise ApiError(f"Baidu API request failed: {exc}") from exc
+        attempt = 0
+        while True:
+            try:
+                response = client.request(
+                    method=method,
+                    url=url,
+                    params=params,
+                    data=data,
+                    files=files,
+                    headers=headers,
+                    timeout=timeout,
+                )
+                break
+            except requests.Timeout as exc:
+                if attempt >= retries:
+                    raise ApiError(f"Baidu API request timed out: {exc}") from exc
+                attempt += 1
+                delay = retry_backoff * attempt if retry_backoff > 0 else 0.0
+                logger.warning(
+                    "Retry upload request after timeout (%s/%s): %s %s",
+                    attempt,
+                    retries,
+                    method,
+                    url,
+                )
+                if delay > 0:
+                    time.sleep(delay)
+            except requests.ConnectionError as exc:
+                if attempt >= retries:
+                    raise ApiError(f"Baidu API connection failed: {exc}") from exc
+                attempt += 1
+                delay = retry_backoff * attempt if retry_backoff > 0 else 0.0
+                logger.warning(
+                    "Retry upload request after connection error (%s/%s): %s %s",
+                    attempt,
+                    retries,
+                    method,
+                    url,
+                )
+                if delay > 0:
+                    time.sleep(delay)
+            except requests.RequestException as exc:
+                raise ApiError(f"Baidu API request failed: {exc}") from exc
         if response.status_code >= 400:
             snippet = response.text[:500]
             raise ApiError(
@@ -1854,6 +1964,8 @@ class BaiduPanClient:
                 files={"file": (file_path.name, wrapped)},
                 session=session,
                 timeout=DEFAULT_UPLOAD_TIMEOUT,
+                retries=DEFAULT_UPLOAD_RETRIES,
+                retry_backoff=DEFAULT_UPLOAD_RETRY_BACKOFF,
             )
 
     def _normalize_byte_range(

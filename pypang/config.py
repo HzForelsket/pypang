@@ -13,6 +13,7 @@ DEFAULT_APP_HOME_DIRNAME = ".pypang"
 DEFAULT_LEGACY_CONFIG_PATH = Path("config.json")
 DEFAULT_MEMBERSHIP_TIER = "free"
 DEFAULT_SINGLE_FILE_DOWNLOAD_WORKERS = 4
+DEFAULT_UPLOAD_VOLUME_WORKERS = 4
 
 
 def _env_int(name: str, default: int) -> int:
@@ -83,6 +84,7 @@ class AppConfig:
     upload_chunk_mb: int = 0
     cli_download_workers: int = 0
     web_download_workers: int = 0
+    upload_volume_workers: int = 0
     single_file_parallel_enabled: bool = True
     single_file_download_workers: int = 0
 
@@ -95,6 +97,7 @@ class AppConfig:
         upload_chunk_mb = payload.get("upload_chunk_mb", 0)
         cli_download_workers = payload.get("cli_download_workers", 0)
         web_download_workers = payload.get("web_download_workers", 0)
+        upload_volume_workers = payload.get("upload_volume_workers", 0)
         single_file_download_workers = payload.get("single_file_download_workers", 0)
         if isinstance(upload_chunk_mb, str) and upload_chunk_mb.strip():
             upload_chunk_mb = int(upload_chunk_mb)
@@ -102,6 +105,8 @@ class AppConfig:
             cli_download_workers = int(cli_download_workers)
         if isinstance(web_download_workers, str) and web_download_workers.strip():
             web_download_workers = int(web_download_workers)
+        if isinstance(upload_volume_workers, str) and upload_volume_workers.strip():
+            upload_volume_workers = int(upload_volume_workers)
         if isinstance(single_file_download_workers, str) and single_file_download_workers.strip():
             single_file_download_workers = int(single_file_download_workers)
 
@@ -124,6 +129,7 @@ class AppConfig:
             upload_chunk_mb=max(0, int(upload_chunk_mb)),
             cli_download_workers=max(0, int(cli_download_workers)),
             web_download_workers=max(0, int(web_download_workers)),
+            upload_volume_workers=max(0, int(upload_volume_workers)),
             single_file_parallel_enabled=_coerce_bool(payload.get("single_file_parallel_enabled"), True),
             single_file_download_workers=max(0, int(single_file_download_workers)),
         )
@@ -147,6 +153,7 @@ class AppConfig:
                 "upload_chunk_mb": _env_int("BAIDUPANWEB_UPLOAD_CHUNK_MB", 0),
                 "cli_download_workers": _env_int("BAIDUPANWEB_CLI_DOWNLOAD_WORKERS", 0),
                 "web_download_workers": _env_int("BAIDUPANWEB_WEB_DOWNLOAD_WORKERS", 0),
+                "upload_volume_workers": _env_int("BAIDUPANWEB_UPLOAD_VOLUME_WORKERS", 0),
                 "single_file_parallel_enabled": _env_bool("BAIDUPANWEB_SINGLE_FILE_PARALLEL_ENABLED", True),
                 "single_file_download_workers": _env_int("BAIDUPANWEB_SINGLE_FILE_DOWNLOAD_WORKERS", 0),
             }
@@ -220,6 +227,9 @@ class AppConfig:
     def max_download_workers(self) -> int:
         return 8
 
+    def max_upload_volume_workers(self) -> int:
+        return 8
+
     def effective_upload_chunk_mb(self) -> int:
         if self.upload_chunk_mb <= 0:
             return self.max_upload_chunk_mb()
@@ -234,6 +244,11 @@ class AppConfig:
         if self.web_download_workers <= 0:
             return self.max_download_workers()
         return max(1, min(self.web_download_workers, self.max_download_workers()))
+
+    def effective_upload_volume_workers(self) -> int:
+        if self.upload_volume_workers <= 0:
+            return DEFAULT_UPLOAD_VOLUME_WORKERS
+        return max(1, min(self.upload_volume_workers, self.max_upload_volume_workers()))
 
     def effective_single_file_download_workers(self) -> int:
         if not self.single_file_parallel_enabled:

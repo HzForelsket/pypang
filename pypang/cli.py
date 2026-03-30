@@ -46,6 +46,7 @@ def _build_parser() -> argparse.ArgumentParser:
     config_set.add_argument("--upload-chunk-mb", type=int)
     config_set.add_argument("--cli-download-workers", type=int)
     config_set.add_argument("--web-download-workers", type=int)
+    config_set.add_argument("--upload-volume-workers", type=int)
     config_set.add_argument(
         "--single-file-parallel-enabled",
         dest="single_file_parallel_enabled",
@@ -422,6 +423,7 @@ def _handle_config(store: StateStore, args) -> int:
         "upload_chunk_mb",
         "cli_download_workers",
         "web_download_workers",
+        "upload_volume_workers",
         "single_file_parallel_enabled",
         "single_file_download_workers",
     ):
