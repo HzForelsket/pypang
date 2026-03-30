@@ -9,7 +9,7 @@ import posixpath
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -32,6 +32,8 @@ DEFAULT_DOWNLOAD_WORKERS = 4
 DEFAULT_SINGLE_FILE_DOWNLOAD_WORKERS = 4
 MIN_SINGLE_FILE_PARALLEL_SIZE = 8 * 1024 * 1024
 CHECKSUM_READ_SIZE = 8 * 1024 * 1024
+DEFAULT_VOLUME_SPLIT_SIZE = 2_000_000_000
+DEFAULT_UPLOAD_VOLUME_WORKERS = 2
 logger = logging.getLogger(__name__)
 MD5_RE = re.compile(r"^[0-9a-f]{32}$")
 
@@ -62,6 +64,53 @@ class UploadVolumeSpec:
     size: int
     target: str
     digest_plan: UploadDigestPlan | None = None
+
+
+class _MultiVolumeUploadProgress:
+    def __init__(self, callback: UploadProgressCallback | None, *, label: str, total_bytes: int, volume_count: int):
+        self._callback = callback
+        self._label = label
+        self._total_bytes = int(total_bytes)
+        self._volume_count = int(volume_count)
+        self._lock = threading.Lock()
+        self._volume_progress: dict[int, int] = {}
+        self._completed_volumes: set[int] = set()
+
+    def callback_for(self, volume_index: int) -> UploadProgressCallback | None:
+        if self._callback is None:
+            return None
+
+        def _callback(event: dict[str, Any]) -> None:
+            phase = str(event.get("phase") or "")
+            transferred = int(event.get("transferred_bytes", 0) or 0)
+            total = int(event.get("total_bytes", 0) or 0)
+            delta = int(event.get("delta_bytes", 0) or 0)
+            with self._lock:
+                self._volume_progress[int(volume_index)] = max(0, min(transferred, total or transferred))
+                if phase == "completed":
+                    self._completed_volumes.add(int(volume_index))
+                aggregate_transferred = sum(self._volume_progress.values())
+                active_uploads = sum(
+                    1
+                    for index, value in self._volume_progress.items()
+                    if index not in self._completed_volumes and value > 0
+                )
+            self._callback(
+                {
+                    "phase": "completed"
+                    if len(self._completed_volumes) >= self._volume_count
+                    else "uploading",
+                    "label": self._label,
+                    "transferred_bytes": aggregate_transferred,
+                    "total_bytes": self._total_bytes,
+                    "delta_bytes": delta,
+                    "active_uploads": int(max(1, active_uploads) if aggregate_transferred > 0 else active_uploads),
+                    "completed_volumes": int(len(self._completed_volumes)),
+                    "volume_count": self._volume_count,
+                }
+            )
+
+        return _callback
 
 
 DownloadProgressCallback = Callable[[dict[str, Any]], None]
@@ -191,6 +240,9 @@ class BaiduPanClient:
         if tier == "vip":
             return 10_000_000_000
         return 4_000_000_000
+
+    def volume_split_bytes(self) -> int:
+        return min(self.max_upload_file_bytes(), DEFAULT_VOLUME_SPLIT_SIZE)
 
     def is_authorized(self) -> bool:
         token = self.token
@@ -450,7 +502,7 @@ class BaiduPanClient:
 
         remote_target = self.resolve_upload_target(source.name, remote_path)
         total_size = int(source.stat().st_size)
-        volume_limit = self.max_upload_file_bytes()
+        volume_limit = self.volume_split_bytes()
         if total_size <= volume_limit:
             return self._upload_single_file(
                 source,
@@ -479,6 +531,12 @@ class BaiduPanClient:
             for index in range(volume_count)
         ]
         uploaded_volumes: list[dict[str, Any]] = []
+        progress = _MultiVolumeUploadProgress(
+            progress_callback,
+            label=volume_dir,
+            total_bytes=total_size,
+            volume_count=volume_count,
+        )
         first_spec = self._prepare_upload_volume(
             source,
             volume_specs[0],
@@ -487,50 +545,101 @@ class BaiduPanClient:
             volume_count=volume_count,
             report_as_prepare=False,
         )
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            for index, spec in enumerate(volume_specs):
-                if index == 0:
-                    prepared_spec = first_spec
-                else:
-                    prepared_spec = next_future.result()
-                    if prepared_spec.index != spec.index:
-                        raise ConfigurationError("Upload pipeline returned an unexpected volume order.")
-                if index + 1 < len(volume_specs):
-                    next_future = executor.submit(
-                        self._prepare_upload_volume,
-                        source,
-                        volume_specs[index + 1],
-                        prefer_single_step=prefer_single_step,
-                        progress_callback=progress_callback,
-                        volume_count=volume_count,
-                        report_as_prepare=True,
-                    )
-                result = self._upload_single_file(
+        volume_workers = min(DEFAULT_UPLOAD_VOLUME_WORKERS, volume_count)
+        next_spec_index = 1
+        next_prepare_future = None
+        pending_uploads: dict[Any, UploadVolumeSpec] = {}
+
+        def _submit_upload(prepared_spec: UploadVolumeSpec, upload_executor: ThreadPoolExecutor) -> None:
+            future = upload_executor.submit(
+                self._upload_single_file,
+                source,
+                prepared_spec.target,
+                policy=policy,
+                prefer_single_step=prefer_single_step,
+                progress_callback=progress.callback_for(prepared_spec.index + 1),
+                byte_range=(prepared_spec.start, prepared_spec.size),
+                digest_plan=prepared_spec.digest_plan,
+                volume_index=prepared_spec.index + 1,
+                volume_count=volume_count,
+            )
+            pending_uploads[future] = prepared_spec
+
+        with ThreadPoolExecutor(max_workers=1) as prepare_executor, ThreadPoolExecutor(
+            max_workers=volume_workers
+        ) as upload_executor:
+            _submit_upload(first_spec, upload_executor)
+            if next_spec_index < len(volume_specs):
+                next_prepare_future = prepare_executor.submit(
+                    self._prepare_upload_volume,
                     source,
-                    prepared_spec.target,
-                    policy=policy,
+                    volume_specs[next_spec_index],
                     prefer_single_step=prefer_single_step,
                     progress_callback=progress_callback,
-                    byte_range=(prepared_spec.start, prepared_spec.size),
-                    digest_plan=prepared_spec.digest_plan,
-                    volume_index=prepared_spec.index + 1,
                     volume_count=volume_count,
+                    report_as_prepare=True,
                 )
-                uploaded_volumes.append(
-                    {
-                        "index": prepared_spec.index + 1,
-                        "path": result.get("path") or prepared_spec.target,
-                        "size": prepared_spec.size,
-                        "offset": prepared_spec.start,
-                        "result": result,
-                    }
-                )
+                next_spec_index += 1
+
+            while pending_uploads or next_prepare_future is not None:
+                while (
+                    next_prepare_future is not None
+                    and next_prepare_future.done()
+                    and len(pending_uploads) < volume_workers
+                ):
+                    prepared_spec = next_prepare_future.result()
+                    _submit_upload(prepared_spec, upload_executor)
+                    if next_spec_index < len(volume_specs):
+                        next_prepare_future = prepare_executor.submit(
+                            self._prepare_upload_volume,
+                            source,
+                            volume_specs[next_spec_index],
+                            prefer_single_step=prefer_single_step,
+                            progress_callback=progress_callback,
+                            volume_count=volume_count,
+                            report_as_prepare=True,
+                        )
+                        next_spec_index += 1
+                    else:
+                        next_prepare_future = None
+
+                if pending_uploads:
+                    done, _ = wait(list(pending_uploads.keys()), timeout=0.2, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        prepared_spec = pending_uploads.pop(future)
+                        result = future.result()
+                        uploaded_volumes.append(
+                            {
+                                "index": prepared_spec.index + 1,
+                                "path": result.get("path") or prepared_spec.target,
+                                "size": prepared_spec.size,
+                                "offset": prepared_spec.start,
+                                "result": result,
+                            }
+                        )
+                elif next_prepare_future is not None:
+                    prepared_spec = next_prepare_future.result()
+                    _submit_upload(prepared_spec, upload_executor)
+                    if next_spec_index < len(volume_specs):
+                        next_prepare_future = prepare_executor.submit(
+                            self._prepare_upload_volume,
+                            source,
+                            volume_specs[next_spec_index],
+                            prefer_single_step=prefer_single_step,
+                            progress_callback=progress_callback,
+                            volume_count=volume_count,
+                            report_as_prepare=True,
+                        )
+                        next_spec_index += 1
+                    else:
+                        next_prepare_future = None
 
         script_result = self.upload_text_file(
             self._build_extract_script(Path(remote_target).name, volume_specs),
             posixpath.join(volume_dir, "extract.sh"),
             ondup="overwrite",
         )
+        uploaded_volumes.sort(key=lambda item: int(item.get("index", 0) or 0))
         return {
             "path": volume_dir,
             "is_multi_volume": True,
@@ -1685,38 +1794,42 @@ class BaiduPanClient:
         range_start, range_size = self._normalize_byte_range(file_path, byte_range)
         with file_path.open("rb") as handle:
             chunk_size = self.upload_chunk_size()
-            handle.seek(range_start + (part_index * chunk_size))
             remaining = max(0, range_size - (part_index * chunk_size))
-            chunk = handle.read(min(chunk_size, remaining))
-        state = {"sent": int(transferred_bytes)}
-        wrapped = _ProgressReader(
-            io.BytesIO(chunk),
-            callback=lambda size: (
-                state.__setitem__("sent", state["sent"] + size),
-                self._report_upload_progress(
-                    progress_callback,
-                    phase="uploading",
-                    label=label or remote_path,
-                    transferred_bytes=state["sent"],
-                    total_bytes=total_bytes,
-                    delta_bytes=size,
-                ),
-            )[-1],
-        )
+            part_size = min(chunk_size, remaining)
+            reader = _RangeReader(
+                handle,
+                start=range_start + (part_index * chunk_size),
+                length=part_size,
+            )
+            state = {"sent": int(transferred_bytes)}
+            wrapped = _ProgressReader(
+                reader,
+                callback=lambda size: (
+                    state.__setitem__("sent", state["sent"] + size),
+                    self._report_upload_progress(
+                        progress_callback,
+                        phase="uploading",
+                        label=label or remote_path,
+                        transferred_bytes=state["sent"],
+                        total_bytes=total_bytes,
+                        delta_bytes=size,
+                    ),
+                )[-1],
+            )
 
-        return self._request_json(
-            "POST",
-            f"{server_url.rstrip('/')}/rest/2.0/pcs/superfile2",
-            params={
-                "method": "upload",
-                "access_token": self._access_token(),
-                "type": "tmpfile",
-                "path": remote_path,
-                "uploadid": upload_id,
-                "partseq": part_index,
-            },
-            files={"file": (file_path.name, wrapped)},
-        )
+            return self._request_json(
+                "POST",
+                f"{server_url.rstrip('/')}/rest/2.0/pcs/superfile2",
+                params={
+                    "method": "upload",
+                    "access_token": self._access_token(),
+                    "type": "tmpfile",
+                    "path": remote_path,
+                    "uploadid": upload_id,
+                    "partseq": part_index,
+                },
+                files={"file": (file_path.name, wrapped)},
+            )
 
     def _normalize_byte_range(
         self,

@@ -221,6 +221,8 @@ class _CliProgressRenderer:
         label = str(display_event.get("label") or self.action)
         volume_index = int(display_event.get("volume_index", 0) or 0)
         volume_count = int(display_event.get("volume_count", 0) or 0)
+        active_uploads = int(display_event.get("active_uploads", 0) or 0)
+        completed_volumes = int(display_event.get("completed_volumes", 0) or 0)
         total = int(
             display_event.get("download_total_bytes", 0)
             or display_event.get("verify_total_bytes", 0)
@@ -275,9 +277,13 @@ class _CliProgressRenderer:
                 "downloading": "downloading",
                 "verifying": "verifying",
             }.get(phase, phase or self.action)
-            if volume_count > 1 and volume_index > 0:
+            if phase == "uploading" and volume_count > 1 and active_uploads > 1:
+                phase_text = f"uploading {active_uploads}x"
+            elif volume_count > 1 and volume_index > 0:
                 phase_text = f"{phase_text} volume {volume_index}/{volume_count}"
             line = f"{self.action}: {phase_text:<22} {percent}  {_format_size(value)}/{_format_size(total) if total else '?'}  {speed_text:<10}  {label}"
+            if volume_count > 1 and completed_volumes > 0:
+                line += f" | done {completed_volumes}/{volume_count}"
             if self._prepare_event:
                 prepare_index = int(self._prepare_event.get("volume_index", 0) or 0)
                 prepare_count = int(self._prepare_event.get("volume_count", 0) or 0)
