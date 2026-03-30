@@ -34,6 +34,8 @@ MIN_SINGLE_FILE_PARALLEL_SIZE = 8 * 1024 * 1024
 CHECKSUM_READ_SIZE = 8 * 1024 * 1024
 DEFAULT_VOLUME_SPLIT_SIZE = 2_000_000_000
 DEFAULT_UPLOAD_VOLUME_WORKERS = 2
+DEFAULT_API_TIMEOUT = 120
+DEFAULT_UPLOAD_TIMEOUT = 1800
 logger = logging.getLogger(__name__)
 MD5_RE = re.compile(r"^[0-9a-f]{32}$")
 
@@ -666,13 +668,112 @@ class BaiduPanClient:
         range_start, range_size = self._normalize_byte_range(source, byte_range)
         uploaded_bytes = 0
         chunk_size = self.upload_chunk_size()
-        if prefer_single_step and range_size <= min(chunk_size, 2_000_000_000):
-            result = self.upload_file_single_step(
-                source,
-                remote_target,
-                ondup=policy,
-                progress_callback=progress_callback,
-                byte_range=(range_start, range_size),
+        with requests.Session() as upload_session:
+            if prefer_single_step and range_size <= min(chunk_size, 2_000_000_000):
+                result = self.upload_file_single_step(
+                    source,
+                    remote_target,
+                    ondup=policy,
+                    progress_callback=progress_callback,
+                    byte_range=(range_start, range_size),
+                    session=upload_session,
+                )
+                self._report_upload_progress(
+                    progress_callback,
+                    phase="completed",
+                    label=remote_target,
+                    transferred_bytes=range_size,
+                    total_bytes=range_size,
+                    volume_index=volume_index,
+                    volume_count=volume_count,
+                )
+                return result
+
+            if digest_plan is None:
+                digest_plan = self._build_upload_digests(
+                    source,
+                    progress_callback=progress_callback,
+                    label=remote_target,
+                    byte_range=(range_start, range_size),
+                )
+            precreate = self._request_json(
+                "POST",
+                f"{PAN_BASE_URL}/rest/2.0/xpan/file",
+                params={
+                    "method": "precreate",
+                    "access_token": self._access_token(),
+                },
+                data={
+                    "path": remote_target,
+                    "size": digest_plan.size,
+                    "isdir": 0,
+                    "autoinit": 1,
+                    "rtype": self._rtype_from_policy(policy),
+                    "block_list": json.dumps(
+                        digest_plan.block_list, ensure_ascii=False, separators=(",", ":")
+                    ),
+                    "content-md5": digest_plan.content_md5,
+                    "slice-md5": digest_plan.slice_md5,
+                    "local_ctime": digest_plan.local_ctime,
+                    "local_mtime": digest_plan.local_mtime,
+                },
+                session=upload_session,
+            )
+
+            upload_id = str(precreate.get("uploadid", "")).strip()
+            if not upload_id:
+                raise ApiError("precreate did not return uploadid", payload=precreate)
+
+            upload_server = self.locate_upload_server(remote_target, upload_id, session=upload_session)
+            missing_parts = self._normalize_missing_parts(precreate.get("block_list"))
+            if not missing_parts:
+                uploaded_bytes = range_size
+            self._report_upload_progress(
+                progress_callback,
+                phase="uploading",
+                label=remote_target,
+                transferred_bytes=uploaded_bytes,
+                total_bytes=range_size,
+                volume_index=volume_index,
+                volume_count=volume_count,
+            )
+            for index in missing_parts:
+                self._upload_part(
+                    server_url=upload_server,
+                    remote_path=remote_target,
+                    upload_id=upload_id,
+                    part_index=index,
+                    file_path=source,
+                    progress_callback=progress_callback,
+                    total_bytes=range_size,
+                    transferred_bytes=uploaded_bytes,
+                    label=remote_target,
+                    byte_range=(range_start, range_size),
+                    session=upload_session,
+                )
+                part_size = min(chunk_size, max(0, range_size - (index * chunk_size)))
+                uploaded_bytes += part_size
+
+            result = self._request_json(
+                "POST",
+                f"{PAN_BASE_URL}/rest/2.0/xpan/file",
+                params={
+                    "method": "create",
+                    "access_token": self._access_token(),
+                },
+                data={
+                    "path": remote_target,
+                    "size": digest_plan.size,
+                    "isdir": 0,
+                    "rtype": self._rtype_from_policy(policy),
+                    "uploadid": upload_id,
+                    "block_list": json.dumps(
+                        digest_plan.block_list, ensure_ascii=False, separators=(",", ":")
+                    ),
+                    "local_ctime": digest_plan.local_ctime,
+                    "local_mtime": digest_plan.local_mtime,
+                },
+                session=upload_session,
             )
             self._report_upload_progress(
                 progress_callback,
@@ -684,100 +785,6 @@ class BaiduPanClient:
                 volume_count=volume_count,
             )
             return result
-
-        if digest_plan is None:
-            digest_plan = self._build_upload_digests(
-                source,
-                progress_callback=progress_callback,
-                label=remote_target,
-                byte_range=(range_start, range_size),
-            )
-        precreate = self._request_json(
-            "POST",
-            f"{PAN_BASE_URL}/rest/2.0/xpan/file",
-            params={
-                "method": "precreate",
-                "access_token": self._access_token(),
-            },
-            data={
-                "path": remote_target,
-                "size": digest_plan.size,
-                "isdir": 0,
-                "autoinit": 1,
-                "rtype": self._rtype_from_policy(policy),
-                "block_list": json.dumps(
-                    digest_plan.block_list, ensure_ascii=False, separators=(",", ":")
-                ),
-                "content-md5": digest_plan.content_md5,
-                "slice-md5": digest_plan.slice_md5,
-                "local_ctime": digest_plan.local_ctime,
-                "local_mtime": digest_plan.local_mtime,
-            },
-        )
-
-        upload_id = str(precreate.get("uploadid", "")).strip()
-        if not upload_id:
-            raise ApiError("precreate did not return uploadid", payload=precreate)
-
-        upload_server = self.locate_upload_server(remote_target, upload_id)
-        missing_parts = self._normalize_missing_parts(precreate.get("block_list"))
-        if not missing_parts:
-            uploaded_bytes = range_size
-        self._report_upload_progress(
-            progress_callback,
-            phase="uploading",
-            label=remote_target,
-            transferred_bytes=uploaded_bytes,
-            total_bytes=range_size,
-            volume_index=volume_index,
-            volume_count=volume_count,
-        )
-        for index in missing_parts:
-            self._upload_part(
-                server_url=upload_server,
-                remote_path=remote_target,
-                upload_id=upload_id,
-                part_index=index,
-                file_path=source,
-                progress_callback=progress_callback,
-                total_bytes=range_size,
-                transferred_bytes=uploaded_bytes,
-                label=remote_target,
-                byte_range=(range_start, range_size),
-            )
-            part_size = min(chunk_size, max(0, range_size - (index * chunk_size)))
-            uploaded_bytes += part_size
-
-        result = self._request_json(
-            "POST",
-            f"{PAN_BASE_URL}/rest/2.0/xpan/file",
-            params={
-                "method": "create",
-                "access_token": self._access_token(),
-            },
-            data={
-                "path": remote_target,
-                "size": digest_plan.size,
-                "isdir": 0,
-                "rtype": self._rtype_from_policy(policy),
-                "uploadid": upload_id,
-                "block_list": json.dumps(
-                    digest_plan.block_list, ensure_ascii=False, separators=(",", ":")
-                ),
-                "local_ctime": digest_plan.local_ctime,
-                "local_mtime": digest_plan.local_mtime,
-            },
-        )
-        self._report_upload_progress(
-            progress_callback,
-            phase="completed",
-            label=remote_target,
-            transferred_bytes=range_size,
-            total_bytes=range_size,
-            volume_index=volume_index,
-            volume_count=volume_count,
-        )
-        return result
 
     def _prepare_upload_volume(
         self,
@@ -827,6 +834,7 @@ class BaiduPanClient:
         ondup: str = "overwrite",
         progress_callback: UploadProgressCallback | None = None,
         byte_range: tuple[int, int] | None = None,
+        session: requests.Session | None = None,
     ) -> dict[str, Any]:
         source = Path(local_path)
         remote_target = self.normalize_remote_path(remote_path)
@@ -866,6 +874,8 @@ class BaiduPanClient:
                     "ondup": self._ondup_from_policy(ondup),
                 },
                 files={"file": (source.name, wrapped)},
+                session=session,
+                timeout=DEFAULT_UPLOAD_TIMEOUT,
             )
 
     def upload_text_file(
@@ -890,7 +900,13 @@ class BaiduPanClient:
             files={"file": (Path(remote_target).name, io.BytesIO(payload))},
         )
 
-    def locate_upload_server(self, remote_path: str, upload_id: str) -> str:
+    def locate_upload_server(
+        self,
+        remote_path: str,
+        upload_id: str,
+        *,
+        session: requests.Session | None = None,
+    ) -> str:
         remote_target = self.normalize_remote_path(remote_path)
         payload = self._request_json(
             "GET",
@@ -903,6 +919,7 @@ class BaiduPanClient:
                 "uploadid": upload_id,
                 "upload_version": "2.0",
             },
+            session=session,
         )
 
         servers = payload.get("servers") or []
@@ -1643,19 +1660,25 @@ class BaiduPanClient:
         data: dict[str, Any] | None = None,
         files: dict[str, Any] | None = None,
         auth_request: bool = False,
+        session: requests.Session | None = None,
+        timeout: float | tuple[float, float] = DEFAULT_API_TIMEOUT,
     ) -> dict[str, Any]:
         headers = self._base_headers()
         if auth_request:
             headers.pop("Host", None)
-        response = self.session.request(
-            method=method,
-            url=url,
-            params=params,
-            data=data,
-            files=files,
-            headers=headers,
-            timeout=120,
-        )
+        client = session or self.session
+        try:
+            response = client.request(
+                method=method,
+                url=url,
+                params=params,
+                data=data,
+                files=files,
+                headers=headers,
+                timeout=timeout,
+            )
+        except requests.RequestException as exc:
+            raise ApiError(f"Baidu API request failed: {exc}") from exc
         if response.status_code >= 400:
             snippet = response.text[:500]
             raise ApiError(
@@ -1790,6 +1813,7 @@ class BaiduPanClient:
         transferred_bytes: int = 0,
         label: str | None = None,
         byte_range: tuple[int, int] | None = None,
+        session: requests.Session | None = None,
     ) -> dict[str, Any]:
         range_start, range_size = self._normalize_byte_range(file_path, byte_range)
         with file_path.open("rb") as handle:
@@ -1829,6 +1853,8 @@ class BaiduPanClient:
                     "partseq": part_index,
                 },
                 files={"file": (file_path.name, wrapped)},
+                session=session,
+                timeout=DEFAULT_UPLOAD_TIMEOUT,
             )
 
     def _normalize_byte_range(
