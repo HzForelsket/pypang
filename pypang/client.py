@@ -55,6 +55,15 @@ class DownloadSpec:
     md5: str = ""
 
 
+@dataclass(slots=True)
+class UploadVolumeSpec:
+    index: int
+    start: int
+    size: int
+    target: str
+    digest_plan: UploadDigestPlan | None = None
+
+
 DownloadProgressCallback = Callable[[dict[str, Any]], None]
 UploadProgressCallback = Callable[[dict[str, Any]], None]
 
@@ -73,6 +82,29 @@ class _ProgressReader:
         chunk = self._raw.read(size)
         if chunk and self._callback:
             self._callback(len(chunk))
+        return chunk
+
+    def __getattr__(self, name: str):
+        return getattr(self._raw, name)
+
+
+class _RangeReader:
+    def __init__(self, raw, *, start: int = 0, length: int | None = None):
+        self._raw = raw
+        self._start = max(0, int(start))
+        self._length = None if length is None else max(0, int(length))
+        self._position = 0
+        self._raw.seek(self._start)
+
+    def read(self, size: int = -1):
+        if self._length is not None:
+            remaining = self._length - self._position
+            if remaining <= 0:
+                return b""
+            if size is None or size < 0 or size > remaining:
+                size = remaining
+        chunk = self._raw.read(size)
+        self._position += len(chunk)
         return chunk
 
     def __getattr__(self, name: str):
@@ -151,6 +183,14 @@ class BaiduPanClient:
         if configured <= 0:
             return maximum
         return max(1, min(configured, maximum))
+
+    def max_upload_file_bytes(self) -> int:
+        tier = self.effective_membership_tier()
+        if tier == "svip":
+            return 20_000_000_000
+        if tier == "vip":
+            return 10_000_000_000
+        return 4_000_000_000
 
     def is_authorized(self) -> bool:
         token = self.token
@@ -410,29 +450,125 @@ class BaiduPanClient:
 
         remote_target = self.resolve_upload_target(source.name, remote_path)
         total_size = int(source.stat().st_size)
+        volume_limit = self.max_upload_file_bytes()
+        if total_size <= volume_limit:
+            return self._upload_single_file(
+                source,
+                remote_target,
+                policy=policy,
+                prefer_single_step=prefer_single_step,
+                progress_callback=progress_callback,
+            )
+
+        volume_count = max(2, math.ceil(total_size / volume_limit))
+        width = max(3, len(str(volume_count)))
+        volume_root = self._build_volume_bundle_dir(remote_target)
+        volume_dir = self.ensure_remote_directory(volume_root)
+        volume_specs = [
+            UploadVolumeSpec(
+                index=index,
+                start=index * volume_limit,
+                size=min(volume_limit, total_size - (index * volume_limit)),
+                target=self._build_volume_remote_path(
+                    posixpath.join(volume_dir, Path(remote_target).name),
+                    index=index,
+                    total=volume_count,
+                    width=width,
+                ),
+            )
+            for index in range(volume_count)
+        ]
+        uploaded_volumes: list[dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            next_future = executor.submit(
+                self._prepare_upload_volume,
+                source,
+                volume_specs[0],
+                prefer_single_step=prefer_single_step,
+            )
+            for index, spec in enumerate(volume_specs):
+                prepared_spec = next_future.result()
+                if prepared_spec.index != spec.index:
+                    raise ConfigurationError("Upload pipeline returned an unexpected volume order.")
+                if index + 1 < len(volume_specs):
+                    next_future = executor.submit(
+                        self._prepare_upload_volume,
+                        source,
+                        volume_specs[index + 1],
+                        prefer_single_step=prefer_single_step,
+                    )
+                result = self._upload_single_file(
+                    source,
+                    prepared_spec.target,
+                    policy=policy,
+                    prefer_single_step=prefer_single_step,
+                    progress_callback=progress_callback,
+                    byte_range=(prepared_spec.start, prepared_spec.size),
+                    digest_plan=prepared_spec.digest_plan,
+                )
+                uploaded_volumes.append(
+                    {
+                        "index": prepared_spec.index + 1,
+                        "path": result.get("path") or prepared_spec.target,
+                        "size": prepared_spec.size,
+                        "offset": prepared_spec.start,
+                        "result": result,
+                    }
+                )
+
+        script_result = self.upload_text_file(
+            self._build_extract_script(Path(remote_target).name, volume_specs),
+            posixpath.join(volume_dir, "extract.sh"),
+            ondup="overwrite",
+        )
+        return {
+            "path": volume_dir,
+            "is_multi_volume": True,
+            "bundle_dir": volume_dir,
+            "extract_script": script_result.get("path") or posixpath.join(volume_dir, "extract.sh"),
+            "volume_size_limit": volume_limit,
+            "volume_count": volume_count,
+            "volumes": uploaded_volumes,
+        }
+
+    def _upload_single_file(
+        self,
+        source: Path,
+        remote_target: str,
+        *,
+        policy: str,
+        prefer_single_step: bool,
+        progress_callback: UploadProgressCallback | None = None,
+        byte_range: tuple[int, int] | None = None,
+        digest_plan: UploadDigestPlan | None = None,
+    ) -> dict[str, Any]:
+        range_start, range_size = self._normalize_byte_range(source, byte_range)
         uploaded_bytes = 0
         chunk_size = self.upload_chunk_size()
-        if prefer_single_step and source.stat().st_size <= chunk_size:
+        if prefer_single_step and range_size <= min(chunk_size, 2_000_000_000):
             result = self.upload_file_single_step(
                 source,
                 remote_target,
                 ondup=policy,
                 progress_callback=progress_callback,
+                byte_range=(range_start, range_size),
             )
             self._report_upload_progress(
                 progress_callback,
                 phase="completed",
                 label=remote_target,
-                transferred_bytes=total_size,
-                total_bytes=total_size,
+                transferred_bytes=range_size,
+                total_bytes=range_size,
             )
             return result
 
-        digest_plan = self._build_upload_digests(
-            source,
-            progress_callback=progress_callback,
-            label=remote_target,
-        )
+        if digest_plan is None:
+            digest_plan = self._build_upload_digests(
+                source,
+                progress_callback=progress_callback,
+                label=remote_target,
+                byte_range=(range_start, range_size),
+            )
         precreate = self._request_json(
             "POST",
             f"{PAN_BASE_URL}/rest/2.0/xpan/file",
@@ -463,13 +599,13 @@ class BaiduPanClient:
         upload_server = self.locate_upload_server(remote_target, upload_id)
         missing_parts = self._normalize_missing_parts(precreate.get("block_list"))
         if not missing_parts:
-            uploaded_bytes = total_size
+            uploaded_bytes = range_size
         self._report_upload_progress(
             progress_callback,
             phase="uploading",
             label=remote_target,
             transferred_bytes=uploaded_bytes,
-            total_bytes=total_size,
+            total_bytes=range_size,
         )
         for index in missing_parts:
             self._upload_part(
@@ -479,11 +615,12 @@ class BaiduPanClient:
                 part_index=index,
                 file_path=source,
                 progress_callback=progress_callback,
-                total_bytes=total_size,
+                total_bytes=range_size,
                 transferred_bytes=uploaded_bytes,
                 label=remote_target,
+                byte_range=(range_start, range_size),
             )
-            part_size = min(chunk_size, max(0, total_size - (index * chunk_size)))
+            part_size = min(chunk_size, max(0, range_size - (index * chunk_size)))
             uploaded_bytes += part_size
 
         result = self._request_json(
@@ -510,10 +647,28 @@ class BaiduPanClient:
             progress_callback,
             phase="completed",
             label=remote_target,
-            transferred_bytes=total_size,
-            total_bytes=total_size,
+            transferred_bytes=range_size,
+            total_bytes=range_size,
         )
         return result
+
+    def _prepare_upload_volume(
+        self,
+        source: Path,
+        spec: UploadVolumeSpec,
+        *,
+        prefer_single_step: bool,
+    ) -> UploadVolumeSpec:
+        chunk_size = self.upload_chunk_size()
+        if prefer_single_step and spec.size <= min(chunk_size, 2_000_000_000):
+            return spec
+        spec.digest_plan = self._build_upload_digests(
+            source,
+            progress_callback=None,
+            label=spec.target,
+            byte_range=(spec.start, spec.size),
+        )
+        return spec
 
     def upload_file_single_step(
         self,
@@ -522,11 +677,12 @@ class BaiduPanClient:
         *,
         ondup: str = "overwrite",
         progress_callback: UploadProgressCallback | None = None,
+        byte_range: tuple[int, int] | None = None,
     ) -> dict[str, Any]:
         source = Path(local_path)
         remote_target = self.normalize_remote_path(remote_path)
         upload_server = "https://c3.pcs.baidu.com"
-        total_size = int(source.stat().st_size)
+        range_start, total_size = self._normalize_byte_range(source, byte_range)
         self._report_upload_progress(
             progress_callback,
             phase="uploading",
@@ -536,8 +692,9 @@ class BaiduPanClient:
         )
         with source.open("rb") as handle:
             state = {"sent": 0}
+            reader = _RangeReader(handle, start=range_start, length=total_size)
             wrapped = _ProgressReader(
-                handle,
+                reader,
                 callback=lambda size: (
                     state.__setitem__("sent", state["sent"] + size),
                     self._report_upload_progress(
@@ -561,6 +718,28 @@ class BaiduPanClient:
                 },
                 files={"file": (source.name, wrapped)},
             )
+
+    def upload_text_file(
+        self,
+        content: str,
+        remote_path: str,
+        *,
+        ondup: str = "overwrite",
+    ) -> dict[str, Any]:
+        remote_target = self.normalize_remote_path(remote_path)
+        upload_server = "https://c3.pcs.baidu.com"
+        payload = content.encode("utf-8")
+        return self._request_json(
+            "POST",
+            f"{upload_server}/rest/2.0/pcs/file",
+            params={
+                "method": "upload",
+                "access_token": self._access_token(),
+                "path": remote_target,
+                "ondup": self._ondup_from_policy(ondup),
+            },
+            files={"file": (Path(remote_target).name, io.BytesIO(payload))},
+        )
 
     def locate_upload_server(self, remote_path: str, upload_id: str) -> str:
         remote_target = self.normalize_remote_path(remote_path)
@@ -1381,9 +1560,10 @@ class BaiduPanClient:
         *,
         progress_callback: UploadProgressCallback | None = None,
         label: str | None = None,
+        byte_range: tuple[int, int] | None = None,
     ) -> UploadDigestPlan:
         stat = file_path.stat()
-        file_size = stat.st_size
+        range_start, file_size = self._normalize_byte_range(file_path, byte_range)
         content_md5 = hashlib.md5()
         block_list: list[str] = []
         self._report_upload_progress(
@@ -1395,13 +1575,15 @@ class BaiduPanClient:
         )
 
         with file_path.open("rb") as handle:
-            first_slice = handle.read(FIRST_SLICE_SIZE)
+            handle.seek(range_start)
+            first_slice = handle.read(min(FIRST_SLICE_SIZE, file_size))
         first_slice_md5 = hashlib.md5(first_slice).hexdigest()
 
         with file_path.open("rb") as handle:
+            handle.seek(range_start)
             hashed_bytes = 0
             while True:
-                chunk = handle.read(self.upload_chunk_size())
+                chunk = handle.read(min(self.upload_chunk_size(), file_size - hashed_bytes))
                 if not chunk:
                     break
                 content_md5.update(chunk)
@@ -1454,11 +1636,14 @@ class BaiduPanClient:
         total_bytes: int = 0,
         transferred_bytes: int = 0,
         label: str | None = None,
+        byte_range: tuple[int, int] | None = None,
     ) -> dict[str, Any]:
+        range_start, range_size = self._normalize_byte_range(file_path, byte_range)
         with file_path.open("rb") as handle:
             chunk_size = self.upload_chunk_size()
-            handle.seek(part_index * chunk_size)
-            chunk = handle.read(chunk_size)
+            handle.seek(range_start + (part_index * chunk_size))
+            remaining = max(0, range_size - (part_index * chunk_size))
+            chunk = handle.read(min(chunk_size, remaining))
         state = {"sent": int(transferred_bytes)}
         wrapped = _ProgressReader(
             io.BytesIO(chunk),
@@ -1487,6 +1672,83 @@ class BaiduPanClient:
                 "partseq": part_index,
             },
             files={"file": (file_path.name, wrapped)},
+        )
+
+    def _normalize_byte_range(
+        self,
+        file_path: Path,
+        byte_range: tuple[int, int] | None = None,
+    ) -> tuple[int, int]:
+        file_size = int(file_path.stat().st_size)
+        if byte_range is None:
+            return 0, file_size
+        start, length = int(byte_range[0]), int(byte_range[1])
+        if start < 0 or length < 0 or start + length > file_size:
+            raise ConfigurationError(f"Upload byte range is invalid for file: {file_path}")
+        return start, length
+
+    def _build_volume_remote_path(self, remote_path: str, *, index: int, total: int, width: int) -> str:
+        normalized = self.normalize_remote_path(remote_path)
+        suffix = f".{index + 1:0{width}d}"
+        return self.normalize_remote_path(f"{normalized}{suffix}")
+
+    def _build_volume_bundle_dir(self, remote_path: str) -> str:
+        normalized = self.normalize_remote_path(remote_path)
+        return self.normalize_remote_path(f"{normalized}.parts")
+
+    def _build_extract_script(self, base_name: str, volume_specs: list[UploadVolumeSpec]) -> str:
+        quoted_name = json.dumps(base_name, ensure_ascii=False)
+        part_names = [Path(spec.target).name for spec in volume_specs]
+        quoted_parts = " ".join(json.dumps(name, ensure_ascii=False) for name in part_names)
+        return (
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n\n"
+            "SCRIPT_DIR=$(cd -- \"$(dirname -- \"$0\")\" && pwd)\n"
+            f"OUTPUT_NAME={quoted_name}\n"
+            "cd \"$SCRIPT_DIR\"\n\n"
+            f"cat {quoted_parts} > \"$OUTPUT_NAME\"\n"
+            "echo \"Restored to $SCRIPT_DIR/$OUTPUT_NAME\"\n\n"
+            "extract_archive() {\n"
+            "  local archive=\"$1\"\n"
+            "  case \"$archive\" in\n"
+            "    *.tar)\n"
+            "      tar -xf \"$archive\"\n"
+            "      ;;\n"
+            "    *.tar.gz|*.tgz)\n"
+            "      tar -xzf \"$archive\"\n"
+            "      ;;\n"
+            "    *.tar.bz2|*.tbz2)\n"
+            "      tar -xjf \"$archive\"\n"
+            "      ;;\n"
+            "    *.tar.xz|*.txz)\n"
+            "      tar -xJf \"$archive\"\n"
+            "      ;;\n"
+            "    *.zip)\n"
+            "      command -v unzip >/dev/null 2>&1 || { echo \"unzip not found\" >&2; return 1; }\n"
+            "      unzip -o \"$archive\"\n"
+            "      ;;\n"
+            "    *.7z)\n"
+            "      command -v 7z >/dev/null 2>&1 || { echo \"7z not found\" >&2; return 1; }\n"
+            "      7z x -y \"$archive\"\n"
+            "      ;;\n"
+            "    *)\n"
+            "      echo \"Skip auto-extract for unsupported archive type: $archive\"\n"
+            "      return 2\n"
+            "      ;;\n"
+            "  esac\n"
+            "}\n\n"
+            "if extract_archive \"$OUTPUT_NAME\"; then\n"
+            f"  rm -f {quoted_parts}\n"
+            "  echo \"Extraction completed. Parts deleted, archive kept: $SCRIPT_DIR/$OUTPUT_NAME\"\n"
+            "else\n"
+            "  status=$?\n"
+            "  if [ \"$status\" -eq 2 ]; then\n"
+            "    echo \"Archive restored. Parts kept because auto-extract is not supported for this file type.\"\n"
+            "    exit 0\n"
+            "  fi\n"
+            "  echo \"Extraction failed. Parts kept for safety, archive kept: $SCRIPT_DIR/$OUTPUT_NAME\" >&2\n"
+            "  exit \"$status\"\n"
+            "fi\n"
         )
 
     def _rtype_from_policy(self, policy: str) -> int:

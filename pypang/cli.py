@@ -308,7 +308,19 @@ def main(argv: list[str] | None = None) -> int:
                 progress_callback=progress.update,
             )
             progress.finish()
-            print(f"Uploaded: {args.local_path} -> {client.display_path(str(result.get('path') or args.remote_path or ''))}")
+            if result.get("is_multi_volume"):
+                print(
+                    f"Uploaded: {args.local_path} -> "
+                    f"{client.display_path(str(result.get('path') or args.remote_path or ''))} "
+                    f"as {int(result.get('volume_count') or 0)} volumes"
+                )
+                for volume in result.get("volumes", []):
+                    print(f"  - {client.display_path(str(volume.get('path') or ''))}")
+            else:
+                print(
+                    f"Uploaded: {args.local_path} -> "
+                    f"{client.display_path(str(result.get('path') or args.remote_path or ''))}"
+                )
             return 0
         if args.command in {"download", "get"}:
             progress = _CliProgressRenderer("download")
