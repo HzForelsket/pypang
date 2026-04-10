@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import sys
+import threading
 import time
 from collections import deque
 from datetime import datetime
@@ -206,6 +207,7 @@ def _print_listing(client: BaiduPanClient, payload: dict) -> None:
 class _CliProgressRenderer:
     def __init__(self, action: str):
         self.action = action
+        self._lock = threading.Lock()
         self._last_render_at = 0.0
         self._last_line_length = 0
         self._current_value = 0
@@ -218,124 +220,126 @@ class _CliProgressRenderer:
         self._started_at: float | None = None
 
     def update(self, event: dict) -> None:
-        stream = str(event.get("stream") or "foreground")
-        if stream == "prepare":
-            self._prepare_event = dict(event)
-        else:
-            self._last_foreground_event = dict(event)
-            foreground_volume_index = int(event.get("volume_index", 0) or 0)
-            prepare_volume_index = int((self._prepare_event or {}).get("volume_index", 0) or 0)
-            if prepare_volume_index and prepare_volume_index <= foreground_volume_index:
-                self._prepare_event = None
-
-        display_event = self._last_foreground_event or dict(event)
-        phase = str(display_event.get("phase") or "")
-        label = str(display_event.get("label") or self.action)
-        volume_index = int(display_event.get("volume_index", 0) or 0)
-        volume_count = int(display_event.get("volume_count", 0) or 0)
-        active_uploads = int(display_event.get("active_uploads", 0) or 0)
-        completed_volumes = int(display_event.get("completed_volumes", 0) or 0)
-        total = int(
-            display_event.get("download_total_bytes", 0)
-            or display_event.get("verify_total_bytes", 0)
-            or display_event.get("total_bytes", 0)
-            or 0
-        )
-        if "downloaded_bytes" in display_event:
-            value = int(display_event.get("downloaded_bytes", 0) or 0)
-            delta = int(display_event.get("download_delta_bytes", 0) or 0)
-        elif "verify_bytes" in display_event and phase == "verifying":
-            value = int(display_event.get("verify_bytes", 0) or 0)
-            delta = 0
-        else:
-            if stream != "prepare" and bool(display_event.get("incremental")):
-                self._current_value += int(display_event.get("delta_bytes", 0) or 0)
-            elif stream != "prepare":
-                self._current_value = int(display_event.get("transferred_bytes", 0) or 0)
+        with self._lock:
+            stream = str(event.get("stream") or "foreground")
+            if stream == "prepare":
+                self._prepare_event = dict(event)
             else:
-                self._current_value = int(display_event.get("transferred_bytes", 0) or 0)
-            value = self._current_value
-            delta = int(display_event.get("delta_bytes", 0) or 0)
+                self._last_foreground_event = dict(event)
+                foreground_volume_index = int(event.get("volume_index", 0) or 0)
+                prepare_volume_index = int((self._prepare_event or {}).get("volume_index", 0) or 0)
+                if prepare_volume_index and prepare_volume_index <= foreground_volume_index:
+                    self._prepare_event = None
 
-        now = time.time()
-        if stream != "prepare" and self._started_at is None:
-            self._started_at = now
-        if stream != "prepare":
-            if phase != self._last_speed_phase or volume_index != self._last_speed_volume_index:
-                self._last_speed_phase = phase
-                self._last_speed_volume_index = volume_index
-                self._speed_samples.clear()
-                self._window_speed_bps = 0.0
-            elif phase in {"hashing", "uploading", "downloading"}:
-                if delta > 0:
-                    self._speed_samples.append((now, delta))
-                cutoff = now - 6.0
-                while self._speed_samples and self._speed_samples[0][0] < cutoff:
-                    self._speed_samples.popleft()
-                if self._speed_samples:
-                    total_delta = sum(sample_delta for _, sample_delta in self._speed_samples)
-                    window_span = max(now - self._speed_samples[0][0], 1e-6)
-                    self._window_speed_bps = total_delta / window_span
-                else:
-                    self._window_speed_bps = 0.0
-        speed = self._window_speed_bps
-
-        render_interval = 2.0 if phase in {"hashing", "uploading"} else 0.2
-        should_render = phase == "completed" or (now - self._last_render_at) >= render_interval
-        if not should_render:
-            return
-
-        if phase == "completed":
-            elapsed_text = _format_duration((now - self._started_at) if self._started_at else 0.0)
-            line = f"{self.action}: completed  {_format_size(value)}  elapsed {elapsed_text}  {label}"
-        else:
-            percent = f"{(value / total * 100):5.1f}%" if total > 0 else "  ---%"
-            speed_text = f"{_format_size(int(speed))}/s" if speed > 0 else "--"
-            elapsed_text = _format_duration((now - self._started_at) if self._started_at else 0.0)
-            eta_text = "--"
-            if total > 0 and speed > 0 and value < total:
-                eta_text = _format_duration((total - value) / speed)
-            phase_text = {
-                "hashing": "hashing",
-                "uploading": "uploading",
-                "downloading": "downloading",
-                "verifying": "verifying",
-            }.get(phase, phase or self.action)
-            if phase == "uploading" and volume_count > 1 and active_uploads > 1:
-                phase_text = f"uploading {active_uploads}x"
-            elif volume_count > 1 and volume_index > 0:
-                phase_text = f"{phase_text} volume {volume_index}/{volume_count}"
-            line = (
-                f"{self.action}: {phase_text:<22} {percent}  "
-                f"{_format_size(value)}/{_format_size(total) if total else '?'}  "
-                f"{speed_text:<10}  elapsed {elapsed_text}  eta {eta_text}  {label}"
+            display_event = self._last_foreground_event or dict(event)
+            phase = str(display_event.get("phase") or "")
+            label = str(display_event.get("label") or self.action)
+            volume_index = int(display_event.get("volume_index", 0) or 0)
+            volume_count = int(display_event.get("volume_count", 0) or 0)
+            active_uploads = int(display_event.get("active_uploads", 0) or 0)
+            completed_volumes = int(display_event.get("completed_volumes", 0) or 0)
+            total = int(
+                display_event.get("download_total_bytes", 0)
+                or display_event.get("verify_total_bytes", 0)
+                or display_event.get("total_bytes", 0)
+                or 0
             )
-            if volume_count > 1 and completed_volumes > 0:
-                line += f" | done {completed_volumes}/{volume_count}"
-            if self._prepare_event:
-                prepare_index = int(self._prepare_event.get("volume_index", 0) or 0)
-                prepare_count = int(self._prepare_event.get("volume_count", 0) or 0)
-                prepare_total = int(self._prepare_event.get("total_bytes", 0) or 0)
-                prepare_value = int(self._prepare_event.get("transferred_bytes", 0) or 0)
-                if prepare_index > volume_index:
-                    prepare_percent = (
-                        f"{(prepare_value / prepare_total * 100):4.0f}%"
-                        if prepare_total > 0
-                        else "--%"
-                    )
-                    line += f" | preparing volume {prepare_index}/{prepare_count} {prepare_percent}"
+            if "downloaded_bytes" in display_event:
+                value = int(display_event.get("downloaded_bytes", 0) or 0)
+                delta = int(display_event.get("download_delta_bytes", 0) or 0)
+            elif "verify_bytes" in display_event and phase == "verifying":
+                value = int(display_event.get("verify_bytes", 0) or 0)
+                delta = 0
+            else:
+                if stream != "prepare" and bool(display_event.get("incremental")):
+                    self._current_value += int(display_event.get("delta_bytes", 0) or 0)
+                elif stream != "prepare":
+                    self._current_value = int(display_event.get("transferred_bytes", 0) or 0)
+                else:
+                    self._current_value = int(display_event.get("transferred_bytes", 0) or 0)
+                value = self._current_value
+                delta = int(display_event.get("delta_bytes", 0) or 0)
 
-        padding = max(0, self._last_line_length - len(line))
-        sys.stdout.write("\r" + line + (" " * padding))
-        sys.stdout.flush()
-        self._last_line_length = len(line)
-        self._last_render_at = now
+            now = time.time()
+            if stream != "prepare" and self._started_at is None:
+                self._started_at = now
+            if stream != "prepare":
+                if phase != self._last_speed_phase or volume_index != self._last_speed_volume_index:
+                    self._last_speed_phase = phase
+                    self._last_speed_volume_index = volume_index
+                    self._speed_samples.clear()
+                    self._window_speed_bps = 0.0
+                elif phase in {"hashing", "uploading", "downloading"}:
+                    if delta > 0:
+                        self._speed_samples.append((now, delta))
+                    cutoff = now - 6.0
+                    while self._speed_samples and self._speed_samples[0][0] < cutoff:
+                        self._speed_samples.popleft()
+                    if self._speed_samples:
+                        total_delta = sum(sample_delta for _, sample_delta in self._speed_samples)
+                        window_span = max(now - self._speed_samples[0][0], 1e-6)
+                        self._window_speed_bps = total_delta / window_span
+                    else:
+                        self._window_speed_bps = 0.0
+            speed = self._window_speed_bps
+
+            render_interval = 2.0 if phase in {"hashing", "uploading"} else 0.2
+            should_render = phase == "completed" or (now - self._last_render_at) >= render_interval
+            if not should_render:
+                return
+
+            if phase == "completed":
+                elapsed_text = _format_duration((now - self._started_at) if self._started_at else 0.0)
+                line = f"{self.action}: completed  {_format_size(value)}  elapsed {elapsed_text}  {label}"
+            else:
+                percent = f"{(value / total * 100):5.1f}%" if total > 0 else "  ---%"
+                speed_text = f"{_format_size(int(speed))}/s" if speed > 0 else "--"
+                elapsed_text = _format_duration((now - self._started_at) if self._started_at else 0.0)
+                eta_text = "--"
+                if total > 0 and speed > 0 and value < total:
+                    eta_text = _format_duration((total - value) / speed)
+                phase_text = {
+                    "hashing": "hashing",
+                    "uploading": "uploading",
+                    "downloading": "downloading",
+                    "verifying": "verifying",
+                }.get(phase, phase or self.action)
+                if phase == "uploading" and volume_count > 1 and active_uploads > 1:
+                    phase_text = f"uploading {active_uploads}x"
+                elif volume_count > 1 and volume_index > 0:
+                    phase_text = f"{phase_text} volume {volume_index}/{volume_count}"
+                line = (
+                    f"{self.action}: {phase_text:<22} {percent}  "
+                    f"{_format_size(value)}/{_format_size(total) if total else '?'}  "
+                    f"{speed_text:<10}  elapsed {elapsed_text}  eta {eta_text}  {label}"
+                )
+                if volume_count > 1 and completed_volumes > 0:
+                    line += f" | done {completed_volumes}/{volume_count}"
+                if self._prepare_event:
+                    prepare_index = int(self._prepare_event.get("volume_index", 0) or 0)
+                    prepare_count = int(self._prepare_event.get("volume_count", 0) or 0)
+                    prepare_total = int(self._prepare_event.get("total_bytes", 0) or 0)
+                    prepare_value = int(self._prepare_event.get("transferred_bytes", 0) or 0)
+                    if prepare_index > volume_index:
+                        prepare_percent = (
+                            f"{(prepare_value / prepare_total * 100):4.0f}%"
+                            if prepare_total > 0
+                            else "--%"
+                        )
+                        line += f" | preparing volume {prepare_index}/{prepare_count} {prepare_percent}"
+
+            padding = max(0, self._last_line_length - len(line))
+            sys.stdout.write("\r" + line + (" " * padding))
+            sys.stdout.flush()
+            self._last_line_length = len(line)
+            self._last_render_at = now
 
     def finish(self) -> None:
-        if self._last_line_length:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-            self._last_line_length = 0
+        with self._lock:
+            if self._last_line_length:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                self._last_line_length = 0
 
 
 def main(argv: list[str] | None = None) -> int:
