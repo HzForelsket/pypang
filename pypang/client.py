@@ -151,6 +151,145 @@ DownloadProgressCallback = Callable[[dict[str, Any]], None]
 UploadProgressCallback = Callable[[dict[str, Any]], None]
 
 
+class _DirectoryDownloadProgress:
+    def __init__(
+        self,
+        callback: DownloadProgressCallback | None,
+        *,
+        label: str,
+        file_jobs: list[tuple[dict[str, Any], Path]],
+    ):
+        self._callback = callback
+        self._label = label
+        self._lock = threading.Lock()
+        self._started_files: dict[str, dict[str, Any]] = {}
+        self._completed_files: set[str] = set()
+        self._speed_samples: deque[tuple[float, int]] = deque()
+        self._file_order: dict[str, int] = {}
+        self._file_totals: dict[str, int] = {}
+        for index, (entry, _) in enumerate(file_jobs):
+            file_label = str(entry.get("path") or entry.get("server_filename") or f"file-{index + 1}")
+            self._file_order[file_label] = index
+            self._file_totals[file_label] = int(entry.get("size", 0) or 0)
+        self._total_files = len(file_jobs)
+        self._total_bytes = sum(self._file_totals.values())
+
+    def callback(self, event: dict[str, Any]) -> None:
+        if self._callback is None:
+            return
+
+        label = str(event.get("label") or "")
+        if not label:
+            label = f"file-{len(self._started_files) + 1}"
+        phase = str(event.get("phase") or "downloading")
+        now = time.time()
+        delta = max(0, int(event.get("download_delta_bytes", 0) or 0))
+
+        with self._lock:
+            state = self._started_files.get(label)
+            if state is None:
+                state = {
+                    "label": label,
+                    "phase": phase,
+                    "downloaded_bytes": 0,
+                    "download_total_bytes": self._file_totals.get(label, 0),
+                    "verify_bytes": 0,
+                    "verify_total_bytes": self._file_totals.get(label, 0),
+                    "speed_bps": 0.0,
+                    "speed_samples": deque(),
+                    "last_update_at": now,
+                }
+                self._started_files[label] = state
+
+            total = int(event.get("download_total_bytes", 0) or 0) or int(
+                state.get("download_total_bytes", 0) or 0
+            )
+            if total:
+                state["download_total_bytes"] = total
+                self._file_totals[label] = total
+
+            if phase == "downloading":
+                state["downloaded_bytes"] = max(0, int(event.get("downloaded_bytes", 0) or 0))
+                state["verify_bytes"] = int(event.get("verify_bytes", 0) or 0)
+                state["verify_total_bytes"] = int(event.get("verify_total_bytes", 0) or 0)
+            elif phase == "verifying":
+                state["downloaded_bytes"] = max(
+                    int(state.get("downloaded_bytes", 0) or 0),
+                    int(state.get("download_total_bytes", 0) or 0),
+                )
+                state["verify_bytes"] = int(event.get("verify_bytes", 0) or 0)
+                state["verify_total_bytes"] = int(
+                    event.get("verify_total_bytes", state.get("download_total_bytes", 0)) or 0
+                )
+            elif phase == "completed":
+                completed_bytes = int(event.get("downloaded_bytes", 0) or 0)
+                state["downloaded_bytes"] = max(
+                    completed_bytes,
+                    int(state.get("downloaded_bytes", 0) or 0),
+                    int(state.get("download_total_bytes", 0) or 0),
+                )
+                state["verify_bytes"] = int(event.get("verify_bytes", state.get("verify_bytes", 0)) or 0)
+                state["verify_total_bytes"] = int(
+                    event.get("verify_total_bytes", state.get("verify_total_bytes", 0)) or 0
+                )
+                self._completed_files.add(label)
+            state["phase"] = phase
+            state["last_update_at"] = now
+
+            if delta > 0:
+                state["speed_samples"].append((now, delta))
+                self._speed_samples.append((now, delta))
+
+            cutoff = now - 6.0
+            while state["speed_samples"] and state["speed_samples"][0][0] < cutoff:
+                state["speed_samples"].popleft()
+            if state["speed_samples"]:
+                file_delta = sum(sample_delta for _, sample_delta in state["speed_samples"])
+                file_span = max(now - state["speed_samples"][0][0], 1e-6)
+                state["speed_bps"] = file_delta / file_span
+            else:
+                state["speed_bps"] = 0.0
+
+            while self._speed_samples and self._speed_samples[0][0] < cutoff:
+                self._speed_samples.popleft()
+
+            active_files = [
+                {
+                    "label": item["label"],
+                    "phase": item["phase"],
+                    "downloaded_bytes": int(item.get("downloaded_bytes", 0) or 0),
+                    "download_total_bytes": int(item.get("download_total_bytes", 0) or 0),
+                    "verify_bytes": int(item.get("verify_bytes", 0) or 0),
+                    "verify_total_bytes": int(item.get("verify_total_bytes", 0) or 0),
+                    "speed_bps": float(item.get("speed_bps", 0.0) or 0.0),
+                }
+                for file_label, item in self._started_files.items()
+                if file_label not in self._completed_files
+            ]
+            active_files.sort(key=lambda item: self._file_order.get(str(item["label"]), self._total_files))
+
+            aggregate_downloaded = sum(
+                int(item.get("downloaded_bytes", 0) or 0)
+                for item in self._started_files.values()
+            )
+            aggregate_total = sum(self._file_totals.values()) or self._total_bytes
+            aggregate_phase = "completed" if len(self._completed_files) >= self._total_files else "downloading"
+            payload = {
+                "phase": aggregate_phase,
+                "label": self._label,
+                "downloaded_bytes": int(aggregate_downloaded),
+                "download_total_bytes": int(aggregate_total),
+                "download_delta_bytes": int(delta),
+                "multi_file": True,
+                "active_files": active_files,
+                "active_file_count": len(active_files),
+                "completed_files": len(self._completed_files),
+                "total_files": self._total_files,
+            }
+
+        self._callback(payload)
+
+
 class _ProgressReader:
     def __init__(
         self,
@@ -1501,6 +1640,7 @@ class BaiduPanClient:
                 destination,
                 resume=resume,
                 progress_callback=progress_callback,
+                single_file_parallel=single_file_parallel,
             )
 
         default_name = Path(str(entry.get("path", remote_path))).name or "download"
@@ -1525,13 +1665,24 @@ class BaiduPanClient:
         if not file_jobs:
             return target_root
 
+        directory_progress = (
+            _DirectoryDownloadProgress(
+                progress_callback,
+                label=str(entry.get("path") or remote_path),
+                file_jobs=file_jobs,
+            )
+            if progress_callback
+            else None
+        )
+        directory_progress_callback = directory_progress.callback if directory_progress else None
+
         if not parallel:
             for child, local_target in file_jobs:
                 self._download_entry_to_path(
                     child,
                     local_target,
                     resume=resume,
-                    progress_callback=progress_callback,
+                    progress_callback=directory_progress_callback,
                     single_file_parallel=single_file_parallel,
                 )
             return target_root
@@ -1544,7 +1695,7 @@ class BaiduPanClient:
                     child,
                     local_target,
                     resume=resume,
-                    progress_callback=progress_callback,
+                    progress_callback=directory_progress_callback,
                     single_file_parallel=single_file_parallel,
                 )
                 for child, local_target in file_jobs

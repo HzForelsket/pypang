@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shutil
 import sys
 import threading
 import time
@@ -218,9 +219,135 @@ class _CliProgressRenderer:
         self._speed_samples: deque[tuple[float, int]] = deque()
         self._window_speed_bps = 0.0
         self._started_at: float | None = None
+        self._is_tty = sys.stdout.isatty()
+        self._last_rendered_lines = 0
+
+    def _terminal_width(self) -> int:
+        return max(40, shutil.get_terminal_size((120, 20)).columns - 1)
+
+    def _truncate(self, text: str, width: int) -> str:
+        if width <= 0:
+            return ""
+        if len(text) <= width:
+            return text
+        if width <= 3:
+            return "." * width
+        return "..." + text[-(width - 3):]
+
+    def _line_with_label(self, prefix: str, label: str, width: int) -> str:
+        if len(prefix) >= width:
+            return self._truncate(prefix, width)
+        return prefix + self._truncate(label, width - len(prefix))
+
+    def _write_single_line(self, line: str) -> None:
+        if not self._is_tty:
+            sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+            self._last_line_length = 0
+            return
+        line = self._truncate(line, self._terminal_width())
+        padding = max(0, self._last_line_length - len(line))
+        sys.stdout.write("\r" + line + (" " * padding))
+        sys.stdout.flush()
+        self._last_line_length = len(line)
+
+    def _render_lines(self, lines: list[str]) -> None:
+        width = self._terminal_width()
+        fitted_lines = [self._truncate(line, width) for line in lines]
+        if self._last_rendered_lines:
+            sys.stdout.write("\r")
+            if self._last_rendered_lines > 1:
+                sys.stdout.write(f"\x1b[{self._last_rendered_lines - 1}A")
+        rendered_count = max(self._last_rendered_lines, len(fitted_lines))
+        padded_lines = fitted_lines + [""] * (rendered_count - len(fitted_lines))
+        sys.stdout.write("\n".join("\x1b[2K" + line for line in padded_lines))
+        sys.stdout.flush()
+        self._last_rendered_lines = rendered_count
+        self._last_line_length = 0
+
+    def _update_window_speed(self, *, now: float, delta: int, active: bool = True) -> float:
+        if active and delta > 0:
+            self._speed_samples.append((now, delta))
+        cutoff = now - 6.0
+        while self._speed_samples and self._speed_samples[0][0] < cutoff:
+            self._speed_samples.popleft()
+        if self._speed_samples:
+            total_delta = sum(sample_delta for _, sample_delta in self._speed_samples)
+            window_span = max(now - self._speed_samples[0][0], 1e-6)
+            self._window_speed_bps = total_delta / window_span
+        else:
+            self._window_speed_bps = 0.0
+        return self._window_speed_bps
+
+    def _format_percent(self, value: int, total: int) -> str:
+        return f"{(value / total * 100):5.1f}%" if total > 0 else "  ---%"
+
+    def _update_multi_file(self, event: dict) -> None:
+        now = time.time()
+        if self._started_at is None:
+            self._started_at = now
+
+        phase = str(event.get("phase") or "downloading")
+        value = int(event.get("downloaded_bytes", 0) or 0)
+        total = int(event.get("download_total_bytes", 0) or 0)
+        delta = int(event.get("download_delta_bytes", 0) or 0)
+        speed = self._update_window_speed(now=now, delta=delta, active=phase == "downloading")
+
+        render_interval = 0.2 if self._is_tty else 30.0
+        should_render = phase == "completed" or (now - self._last_render_at) >= render_interval
+        if not should_render:
+            return
+
+        elapsed_text = _format_duration(now - self._started_at)
+        eta_text = "--"
+        if total > 0 and speed > 0 and value < total:
+            eta_text = _format_duration((total - value) / speed)
+        speed_text = f"{_format_size(int(speed))}/s" if speed > 0 else "--"
+        completed_files = int(event.get("completed_files", 0) or 0)
+        total_files = int(event.get("total_files", 0) or 0)
+        active_count = int(event.get("active_file_count", 0) or 0)
+        phase_text = "completed" if phase == "completed" else "downloading"
+        summary = (
+            f"{self.action}: {phase_text:<11} {self._format_percent(value, total)}  "
+            f"{_format_size(value)}/{_format_size(total) if total else '?'}  "
+            f"{speed_text:<10}  files {completed_files}/{total_files} active {active_count}  "
+            f"elapsed {elapsed_text}  eta {eta_text}"
+        )
+
+        if not self._is_tty:
+            self._write_single_line(summary)
+            self._last_render_at = now
+            return
+
+        width = self._terminal_width()
+        lines = [summary]
+        for item in event.get("active_files", []) or []:
+            item_phase = str(item.get("phase") or "downloading")
+            if item_phase == "verifying":
+                item_value = int(item.get("verify_bytes", 0) or 0)
+                item_total = int(item.get("verify_total_bytes", 0) or 0)
+                item_speed_text = "--"
+            else:
+                item_value = int(item.get("downloaded_bytes", 0) or 0)
+                item_total = int(item.get("download_total_bytes", 0) or 0)
+                item_speed = float(item.get("speed_bps", 0.0) or 0.0)
+                item_speed_text = f"{_format_size(int(item_speed))}/s" if item_speed > 0 else "--"
+            prefix = (
+                f"  {item_phase:<10} {self._format_percent(item_value, item_total)}  "
+                f"{_format_size(item_value)}/{_format_size(item_total) if item_total else '?'}  "
+                f"{item_speed_text:<10}  "
+            )
+            lines.append(self._line_with_label(prefix, str(item.get("label") or ""), width))
+
+        self._render_lines(lines)
+        self._last_render_at = now
 
     def update(self, event: dict) -> None:
         with self._lock:
+            if bool(event.get("multi_file")):
+                self._update_multi_file(event)
+                return
+
             stream = str(event.get("stream") or "foreground")
             if stream == "prepare":
                 self._prepare_event = dict(event)
@@ -284,6 +411,8 @@ class _CliProgressRenderer:
             speed = self._window_speed_bps
 
             render_interval = 2.0 if phase in {"hashing", "uploading"} else 0.2
+            if not self._is_tty:
+                render_interval = 30.0
             should_render = phase == "completed" or (now - self._last_render_at) >= render_interval
             if not should_render:
                 return
@@ -328,14 +457,17 @@ class _CliProgressRenderer:
                         )
                         line += f" | preparing volume {prepare_index}/{prepare_count} {prepare_percent}"
 
-            padding = max(0, self._last_line_length - len(line))
-            sys.stdout.write("\r" + line + (" " * padding))
-            sys.stdout.flush()
-            self._last_line_length = len(line)
+            self._write_single_line(line)
             self._last_render_at = now
 
     def finish(self) -> None:
         with self._lock:
+            if self._last_rendered_lines:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                self._last_rendered_lines = 0
+                self._last_line_length = 0
+                return
             if self._last_line_length:
                 sys.stdout.write("\n")
                 sys.stdout.flush()
