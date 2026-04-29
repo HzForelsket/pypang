@@ -42,9 +42,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/HzForelsket/BaiduPanWeb"
-Repository = "https://github.com/HzForelsket/BaiduPanWeb"
-Issues = "https://github.com/HzForelsket/BaiduPanWeb/issues"
+Homepage = "https://github.com/HzForelsket/pypang"
+Repository = "https://github.com/HzForelsket/pypang"
+Issues = "https://github.com/HzForelsket/pypang/issues"
 
 [project.scripts]
 pypang = "pypang.cli:main"
